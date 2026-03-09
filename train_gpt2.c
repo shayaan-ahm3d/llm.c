@@ -16,6 +16,7 @@ There will be other versions of this code that specialize it and make it fast.
 #include <time.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdbool.h>
 #ifdef OMP
 #include <omp.h>
 #endif
@@ -26,13 +27,15 @@ There will be other versions of this code that specialize it and make it fast.
 #include "llmc/tokenizer.h"
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 #include "llmc/dataloader.h"
+// defines: logger_init, logger_log_eval
+#include "llmc/logger.h"
 
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
 // B = batch_size, T = sequence_length, C = channels, V = vocab_size
 
 void encoder_forward(float* out,
-                   int* inp, float* wte, float* wpe,
+                   const int* inp, float* wte, float* wpe,
                    int B, int T, int C) {
     // out is (B,T,C). At each position (b,t), a C-dimensional vector summarizing token & position
     // inp is (B,T) of integers, holding the token ids at each (b,t) position
@@ -761,7 +764,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
-void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
+void gpt2_forward(GPT2 *model, const int* inputs, int* targets, size_t B, size_t T) {
     // targets are optional and could be NULL
 
     // ensure the model was initialized or error out
@@ -1071,11 +1074,14 @@ int sample_mult(float* probabilities, int n, float coin) {
     return n - 1; // in case of rounding errors
 }
 
-void inference(GPT2* model, Tokenizer* tokenizer, int* prompt, int numTokensToGenerate, int batchSize, int sequenceLength, uint64_t* rng_state) {
-	// fill up prompt with the GPT2_EOT, which kicks off the generation
-	for (int i = 0; i < batchSize * sequenceLength; ++i) {
-		prompt[i] = tokenizer->eot_token;
-	}
+void inference(GPT2* model,
+	Tokenizer* tokenizer,
+	int* prompt,
+	const int numTokensToGenerate,
+	const int batchSize,
+	const int sequenceLength,
+	uint64_t* rng_state
+) {
 	// now sample from the model autoregressively
 	printf("generating:\n---\n");
 	for (int t = 1; t < numTokensToGenerate; t++) {
@@ -1106,20 +1112,174 @@ void inference(GPT2* model, Tokenizer* tokenizer, int* prompt, int numTokensToGe
 	printf("\n---\n");
 }
 
+void error_usage() {
+    fprintf(stderr, "Usage:   ./train_gpt2 [options]\n");
+    fprintf(stderr, "Options:\n");
+    // file system input / output
+    fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
+    fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
+    fprintf(stderr, "  -e <string> input .bin filename or descriptor, see code comments as docs. (default = gpt2_124M_bf16.bin)\n");
+    fprintf(stderr, "  -o <string> output log dir (default = NULL, no logging)\n");
+    fprintf(stderr, "  -lg <int>   log gpu info every x steps (default = -1; disabled)\n");
+    fprintf(stderr, "  -n <int>    write optimization checkpoints every how many steps? (default 0, don't)\n");
+    fprintf(stderr, "  -nk <int>   max number of checkpoints to keep in the directory, removing old ones (0 = disable, default)\n");
+    fprintf(stderr, "  -nm <int>   every how many step checkpoints are considered major? major checkpoints never get deleted.\n");
+    fprintf(stderr, "  -y <int>    resume optimization found inside output log dir? (0=restart/overwrite, 1=resume/append)\n");
+    // token layout for each step of the optimization
+    fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");
+    fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
+    fprintf(stderr, "  -d <int>    total desired batch size (default = B * T * num_processes, i.e. no grad accumulation\n");
+    // workload (number of steps)
+    fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
+    // optimization
+    fprintf(stderr, "  -k <string> learning rate scheduler (default = cosine)\n");
+    fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
+    fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, no warmup)\n");
+    fprintf(stderr, "  -q <float>  learning rate decay: final fraction, at end of training (default = 1.0 (no decay))\n");
+    fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
+    fprintf(stderr, "  -sl <float> outlier stability: skip update if loss goes above this in zscore (0.0f=off)\n");
+    fprintf(stderr, "  -sg <float> outlier stability: skip update if grad_norm goes above this in zscore (0.0f=off)\n");
+    // evaluation
+    fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
+    fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to estimate val loss? (default = 20)\n");
+    fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
+    fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
+    fprintf(stderr, "  -h <int>    hellaswag eval run? (default = 0)\n");
+    // debugging
+    fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
+    // numerics
+    fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
+    fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
+    fprintf(stderr, "  -ge <int>   gelu fusion: 0=none, 1=forward, 2=forward+backward (default: 2 for >=SM90, 0 for older GPUs)\n");
+    // memory management
+    fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
+    fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
+    // multi-node settings
+    fprintf(stderr, "  -pn <int>    num_processes (default = 1)\n");
+    fprintf(stderr, "  -pr <int>    process_rank (default = 0)\n");
+    fprintf(stderr, "  -pg <int>    gpus_per_node (default = 8)\n");
+    fprintf(stderr, "  -pm <string> nccl_init_method: tcp,fs,mpi (default = mpi)\n");
+    fprintf(stderr, "  -ps <string> server_ip - used only when nccl_init_method is tcp (default = -1)\n");
+    fprintf(stderr, "  -pp <string> fs_path - used only when nccl_init_method is fs (default = /tmp)\n");
+    exit(EXIT_FAILURE);
+}
+
+// Forwards both the model and the loss and is used for validation splits and evals.
+// In particular it populates cpu_losses with loss at each token.
+// Some of the evals (e.g. HellaSwag) require the per-token losses, which are produced here.
+float gpt2_validate(GPT2 *model, const int* inputs, int* targets, const size_t B, const size_t T) {
+    assert(targets != NULL);
+    // forward the model itself
+    gpt2_forward(model, inputs, targets, B, T);
+    // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
+    const size_t V = model->config.vocab_size;
+    const size_t Vp = model->config.padded_vocab_size;
+
+    ActivationTensors acts = model->acts;
+    // fused classifier: does the forward pass and first part of the backward pass
+    // note: we don't need to generate dlogits here
+    tokenCheck(targets, B*T, V); // while the memcpy is underway, validate the targets
+    return model->mean_loss;
+}
 // ----------------------------------------------------------------------------
 // main training loop
-int main() {
-    // build the GPT-2 model from a checkpoint
-    GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
-
-    // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
+int main(int argc, char* argv[]) {
+	// read in the (optional) command line arguments
+    const char* lr_scheduler_type = "cosine";
+    const char* output_log_dir = NULL;
+    int checkpoint_every = 0; // write checkpoints every how many steps?
+    int checkpoints_keep = 0; // how long checkpoint history do we keep? (in units of checkpoints)
+    int major_checkpoint_every = 0; // major checkpoints never get deleted when maintaining history
+    int resume = 0; // resume the optimization, if one is found inside output_log_dir?
+    int B = 4; // batch size
+    int T = 1024; // sequence length max
+    int total_batch_size = -1; // will be calculated down below later, if not provided
+    float learning_rate = 0.f;
+    int log_gpu_every = -1;
+    int warmup_iterations = 0;
+    float final_learning_rate_frac = 1.0f; // final fraction of learning rate, at end of training
+    float weight_decay = 0.0f;
+    float skip_update_lossz = 0.0f; // skip update if loss goes above this in zscore
+    float skip_update_gradz = 0.0f; // skip update if grad_norm goes above this in zscore
+    int val_loss_every = 20; // every how many steps do we eval validation loss?
+    int val_max_steps = 20; // how many batches max do we eval for validation loss?
+    int sample_every = 20; // every how many steps to do inference?
+    int genT = 64; // number of steps of inference we will do
+    int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
+    int max_steps = -1;
+    int override_enable_tf32 = 1;
+    int use_master_weights = 1;
+    int gelu_fusion = 2; // 0 = none, 1 = forward, 2 = forward+backward (-1 => per-GPU default)
+    int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
+    int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
+    int hellaswag_eval = 1;
+    // multi-node settings
+    int num_processes = 1;  // this should be set by the slurm environment
+    int process_rank = 0;  // this should be set by the slurm environment
+    int gpus_per_node = 8;  // this should be set by the slurm environment
+    char nccl_init_method[256] = "mpi";  // "tcp" or "fs" or "mpi"
+    char server_ip[256] = "";  // used if init_method set to "tcp" -> set to your server ip address
+    char fs_path[256] = "";  // used if init_method set to "fs" -> set to a shared filesystem path
     const char* tiny_stories_train = "dev/data/tinystories/TinyStories_train.bin";
     const char* tiny_stories_val = "dev/data/tinystories/TinyStories_val.bin";
     const char* tiny_shakespeare_train = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* tiny_shakespeare_val = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
+    const char* saved_model_file = "gpt2_124M.bin";
+    for (int i = 1; i < argc; i+=2) {
+        if (i + 1 >= argc) { error_usage(); } // must have arg after flag
+        if (argv[i][0] != '-') { error_usage(); } // must start with dash
+        if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x[y] (one dash, one or two letters)
+        // read in the args
+        if (argv[i][1] == 'i') { tiny_shakespeare_train = argv[i+1]; }
+        else if (argv[i][1] == 'j') { tiny_shakespeare_val = argv[i+1]; }
+        else if (argv[i][1] == 'e') { saved_model_file = argv[i+1]; }
+        else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
+        else if (argv[i][1] == 'n' && argv[i][2] == '\0') { checkpoint_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'y') { resume = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU (micro) batch size
+        else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'd') { total_batch_size = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'l' && argv[i][2] == '\0') { learning_rate = atof(argv[i+1]); }
+        else if (argv[i][1] == 'l' && argv[i][2] == 'g') { log_gpu_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'u') { warmup_iterations = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'q') { final_learning_rate_frac = atof(argv[i+1]); }
+        else if (argv[i][1] == 'c') { weight_decay = atof(argv[i+1]); }
+        else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
+        else if (argv[i][1] == 's' && argv[i][2] == '\0') { sample_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'g' && argv[i][2] == 'e') { gelu_fusion = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'f') { strcpy(fs_path, argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 's') { strcpy(server_ip, argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'n') { num_processes = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'r') { process_rank = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'g') { gpus_per_node = atoi(argv[i+1]); }
+        else if (argv[i][1] == 's' && argv[i][2] == 'l') { skip_update_lossz = atof(argv[i+1]); }
+        else if (argv[i][1] == 's' && argv[i][2] == 'g') { skip_update_gradz = atof(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
+        else { error_usage(); }
+    }
+    Logger logger;
+    logger_init(&logger, output_log_dir, 0, resume);
+
+    // build the GPT-2 model from a checkpoint
+    GPT2 model;
+    gpt2_build_from_checkpoint(&model, saved_model_file);
+
+    // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
+
     int batchSize = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
     int sequenceLength = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader, val_loader;
@@ -1140,7 +1300,7 @@ int main() {
 
     // train
     struct timespec start, end;
-    for (int step = 0; step <= 40; step++) {
+    for (int step = 0; step < 0; step++) {
         // once in a while estimate the validation loss
         if (step % 10 == 0) {
             float val_loss = 0.0f;
@@ -1155,6 +1315,10 @@ int main() {
         }
 
         // once in a while do model inference to print generated text
+        // fill up prompt with the GPT2_EOT, which kicks off the generation
+		for (int i = 0; i < batchSize * sequenceLength; ++i) {
+			prompt[i] = tokenizer.eot_token;
+		}
         inference(&model, &tokenizer, prompt, numInferenceSteps, batchSize, sequenceLength, &rng_state);
 
         // do a training step
@@ -1168,13 +1332,39 @@ int main() {
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
         printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
     }
-
+    // build an EvalLoader for HellaSwag
+    EvalLoader eval_loader;
+    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
+    const bool hellaswag_available = access(hellaswag_path, F_OK) == 0;
+    printf("Hella Swag Available: %i", hellaswag_available);
+    const bool run_hellaswag = hellaswag_eval && hellaswag_available;
+    if (run_hellaswag) {
+    	// no multi-GPU so can set index as 0 and total as 1
+        evalloader_init(&eval_loader, hellaswag_path, B, T, 0, 1);
+        printf("| run hellaswag         | %-50s |\n", run_hellaswag ? "yes" : "no");
+        puts("+-----------------------+----------------------------------------------------+\n");
+	    float eval_acc_norm = 0.0f;
+	    evalloader_reset(&eval_loader);
+		printf("Num Batches: %i\n", eval_loader.num_batches);
+	    for (int i = 0; i < eval_loader.num_batches; i++) {
+	        printf("evaluating HellaSwag: %d/%d\r", i, eval_loader.num_batches);
+			fflush(stdout);
+	        evalloader_next_batch(&eval_loader);
+	        gpt2_validate(&model, eval_loader.inputs, eval_loader.targets, B, T);
+	        int correct = evalloader_stat_losses(&eval_loader, model.acts.losses);
+	        eval_acc_norm += (float)correct;
+	    }
+	    printf("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
+    }
     // free
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
+    if (run_hellaswag) {
+    	evalloader_free(&eval_loader);
+    }
     tokenizer_free(&tokenizer);
     gpt2_free(&model);
     free(prompt);
-    return 0;
+    return EXIT_SUCCESS;
 }
 #endif
