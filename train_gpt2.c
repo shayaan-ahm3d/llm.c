@@ -1173,12 +1173,8 @@ float gpt2_validate(GPT2 *model, const int* inputs, int* targets, const size_t B
     gpt2_forward(model, inputs, targets, B, T);
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
     const size_t V = model->config.vocab_size;
-    const size_t Vp = model->config.padded_vocab_size;
-
-    ActivationTensors acts = model->acts;
-    // fused classifier: does the forward pass and first part of the backward pass
     // note: we don't need to generate dlogits here
-    tokenCheck(targets, B*T, V); // while the memcpy is underway, validate the targets
+    tokenCheck(targets, B*T, V); // validate the targets
     return model->mean_loss;
 }
 // ----------------------------------------------------------------------------
