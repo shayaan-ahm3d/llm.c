@@ -20,6 +20,7 @@ There will be other versions of this code that specialize it and make it fast.
 #ifdef OMP
 #include <omp.h>
 #endif
+#include <blis/blis.h>
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 #include "llmc/utils.h"
@@ -35,24 +36,27 @@ There will be other versions of this code that specialize it and make it fast.
 // B = batch_size, T = sequence_length, C = channels, V = vocab_size
 
 void encoder_forward(float* out,
-                   const int* inp, float* wte, float* wpe,
-                   int B, int T, int C) {
+                   const int* tokenIdsAtPosition, float* wte, float* wpe,
+                   int batchSize, int sequenceLength, int numChannels, int start_pos) {
     // out is (B,T,C). At each position (b,t), a C-dimensional vector summarizing token & position
     // inp is (B,T) of integers, holding the token ids at each (b,t) position
     // wte is (V,C) of token embeddings, short for "weight token embeddings"
     // wpe is (maxT,C) of position embeddings, short for "weight positional embedding"
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
+    // start_pos should be 0 for training, but current token for cached inference
+    // sequenceLength should be 1 for KV cache inference, but full sequenceLength for training
+    for (int b = 0; b < batchSize; b++) {
+        for (int t = 0; t < sequenceLength; t++) {
             // seek to the output position in out[b,t,:]
-            float* out_bt = out + b * T * C + t * C;
+            float* out_bt = out + b*sequenceLength*numChannels + t*numChannels;
             // get the index of the token at inp[b, t]
-            int ix = inp[b * T + t];
+            int ix = tokenIdsAtPosition[b*sequenceLength + t];
             // seek to the position in wte corresponding to the token
-            float* wte_ix = wte + ix * C;
+            float* wte_ix = wte + ix*numChannels;
             // seek to the position in wpe corresponding to the position
-            float* wpe_t = wpe + t * C;
+            float* wpe_t = wpe + (start_pos + t)*numChannels;
             // add the two vectors and store the result in out[b,t,:]
-            for (int i = 0; i < C; i++) {
+            #pragma omp simd
+            for (int i = 0; i < numChannels; i++) {
                 out_bt[i] = wte_ix[i] + wpe_t[i];
             }
         }
@@ -162,49 +166,68 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
     }
 }
 
-void matmul_forward_naive(float* out,
-                         const float* inp, const float* weight, const float* bias,
-                         int B, int T, int C, int OC) {
+void matmul_forward_naive(float* output,
+                         const float* input, const float* weight, const float* bias,
+                         int batchSize, int sequenceLength, int numChannels, int outputChannels) {
     // the most naive implementation of matrix multiplication
     // this serves as an algorithmic reference, and as a fallback for
     // unfriendly input shapes inside matmul_forward(), below.
-    #pragma omp parallel for collapse(2)
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            int bt = b * T + t;
-            for (int o = 0; o < OC; o++) {
+    // input is (B,T,C), weight is (OC, C), bias is (OC)
+    // output will be (B,T,OC)
+    // combining means I have to change the allocations initially as all tensors are contiguous
+    for (int batch = 0; batch < batchSize; ++batch) {
+     	if (bias != NULL) {
+      		// fill matrix with bias terms already
+     		for (int t = 0; t < sequenceLength; ++t) {
+     			const int index = batch*sequenceLength*outputChannels + t*outputChannels;
+     			memcpy(output+index, bias, outputChannels*sizeof(float));
+        	}
+      	}
+    	//    C   =    A   *    B      + C
+    	// output = input * weight.T + output
+    	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+     	sequenceLength, outputChannels, numChannels,
+      	1.f, input+batch*sequenceLength*numChannels, numChannels, weight, numChannels,
+       	1.f, output+batch*sequenceLength*outputChannels, outputChannels);
+   	}
+
+    /*for (int t = 0; t < sequenceLength; t++) {
+            int bt = batch * sequenceLength + t;
+            for (int o = 0; o < outputChannels; o++) {
                 float val = (bias != NULL) ? bias[o] : 0.0f;
-                for (int i = 0; i < C; i++) {
-                    val += inp[bt * C + i] * weight[o*C + i];
+                for (int i = 0; i < numChannels; i++) {
+                    val += inp[bt*numChannels + i] * weight[o*numChannels + i];
                 }
-                out[bt * OC + o] = val;
+                out[bt * outputChannels + o] = val;
             }
-        }
-    }
+        }*/
+
 }
 
 void matmul_forward(float* out,
                     const float* inp, const float* weight, const float* bias,
-                    int B, int T, int C, int OC) {
+                    int batchSize, int sequenceLength, int numChannels, int outputChannels) {
     // most of the running time is spent here and in matmul_backward
     // therefore, the implementation below is very mildly optimized
     // this function is otherwise identical to that of matmul_forward_naive()
     // OC is short for "output channels"
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
     // out will be (B,T,OC)
-
     // make sure the tiled loop will be correct or fallback to naive version
+
+    matmul_forward_naive(out, inp, weight, bias, batchSize, sequenceLength, numChannels, outputChannels);
+    return;
     const int LOOP_UNROLL = 8;
-    if (B*T % LOOP_UNROLL != 0) {
-        matmul_forward_naive(out, inp, weight, bias, B, T, C, OC);
+    if (batchSize*sequenceLength % LOOP_UNROLL != 0) {
+        matmul_forward_naive(out, inp, weight, bias, batchSize, sequenceLength, numChannels, outputChannels);
         return;
     }
 
     // collapse the B and T loops into one and turn it into a strided loop.
     // then we can tile the inner loop, and reuse the loaded weight LOOP_UNROLL many times
     #pragma omp parallel for
-    for (int obt = 0; obt < B * T; obt += LOOP_UNROLL) {
-        for (int o = 0; o < OC; o++) {
+    for (int obt = 0; obt < batchSize * sequenceLength; obt += LOOP_UNROLL) {
+        for (int o = 0; o < outputChannels; o++) {
             // we'll keep LOOP_UNROLL many results in registers
             float result[LOOP_UNROLL];
             // initialize the bias, if it exists
@@ -214,17 +237,17 @@ void matmul_forward(float* out,
             // inner loops. Because we do LOOP_UNROLL steps of inner bt, we can cache
             // the value of weight[i + o * C] and reuse it.
             // we compile with -Ofast, so the compiler will turn the inner loop into FMAs
-            for (int i = 0; i < C; i++) {
-                float w = weight[i + o * C];
+            for (int i = 0; i < numChannels; i++) {
+                float w = weight[i + o * numChannels];
                 for (int ibt = 0; ibt < LOOP_UNROLL; ibt++) {
                     int bt = obt + ibt;
-                    result[ibt] += inp[bt * C + i] * w;
+                    result[ibt] += inp[bt * numChannels + i] * w;
                 }
             }
             // write back results to main memory
             for (int ibt = 0; ibt < LOOP_UNROLL; ibt++) {
                 int bt = obt + ibt;
-                out[bt * OC + o] = result[ibt];
+                out[bt * outputChannels + o] = result[ibt];
             }
         }
     }
@@ -270,36 +293,72 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     }
 }
 
+// use with key-value cache to do partial update of key and value, reducing duplicate calculations
+// pass in cache pointer to correct location within cache for that layer and token
+void cached_matmul_forward(float* const restrict cache, const float* token,
+	const float* const restrict weight, const float* const restrict bias,
+    const int batchSize, const int sequenceLength, const int numChannels, const int outputChannels) {
+    assert(numChannels == outputChannels);
+    // fill that cache line with the bias values already
+    memcpy(cache, bias, numChannels * sizeof(float));
+
+    // only adding one token therefore do matrix-vector multiplication and append the result to K & V
+    //   y   =        A        *      x
+    // cache = weight(K or V) * input(token)
+    cblas_sgemv(CblasRowMajor, // row-major in C
+    CblasNoTrans,
+    outputChannels, // rows of matrix W
+    numChannels, // cols of matrix W
+    1.f,
+    weight, // weight matrix W(k) or W(v)
+    numChannels, // lda
+    token, // current token
+    1, // increment for token vector
+    1.f,
+    cache, // output to the cache
+    1); // increment for cache vector
+}
+
+// do after a prompt is finished
+void reset_kv_cache(float* const keyCache, float* const valueCache, const int size) {
+	memset(keyCache, 0, size*sizeof(float));
+	memset(valueCache, 0, size*sizeof(float));
+}
+
 void attention_forward(float* out, float* preatt, float* att,
-                       float* inp,
-                       int B, int T, int C, int NH) {
-    // input is (B, T, 3C) holding the query, key, value (Q, K, V) vectors
+                       const float* qkv,
+                       int batchSize, int sequenceLength, int numChannels, int numHeads, bool useCache, int currentTokenPosition) {
+    // qkv is (batchSize, sequenceLength, 3*numChannels) holding the query, key, value (Q, K, V) vectors
     // preatt, att are (B, NH, T, T). NH = number of heads, T = sequence length
     // that holds the pre-attention and post-attention scores (used in backward)
     // output is (B, T, C)
     // attention is the only layer that mixes information across time
     // every other operation is applied at every (b,t) position independently
     // (and of course, no layer mixes information across batch)
-    int C3 = C*3;
-    int hs = C / NH; // head size
-    float scale = 1.0 / sqrtf(hs);
+    int C3 = numChannels*3;
+    int headSize = numChannels / numHeads; // split across number of heads
+    float scale = 1.0 / sqrtf(headSize);
 
     #pragma omp parallel for collapse(3)
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            for (int h = 0; h < NH; h++) {
-                float* query_t = inp + b * T * C3 + t * C3 + h * hs;
-                float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
-                float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+    for (int b = 0; b < batchSize; b++) {
+        for (int t = 0; t < (useCache ? 1 : sequenceLength); t++) {
+            for (int h = 0; h < numHeads; h++) {
+                int actual_t = useCache ? currentTokenPosition : t;
+
+                const float* query_t = qkv + b * sequenceLength * C3 + actual_t * C3 + h * headSize;
+                float* preatt_bth = preatt + b*numHeads*sequenceLength*sequenceLength + h*sequenceLength*sequenceLength + actual_t*sequenceLength;
+                float* att_bth = att + b*numHeads*sequenceLength*sequenceLength + h*sequenceLength*sequenceLength + actual_t*sequenceLength;
 
                 // pass 1: calculate query dot key and maxval
                 float maxval = -10000.0f; // TODO something better
-                for (int t2 = 0; t2 <= t; t2++) {
-                    float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+                // this loop iterates over all previous elements in K
+                for (int t2 = 0; t2 <= actual_t; t2++) {
+                	// query is t but key is t2 as key requires full history of previous tokens, whereas query just requires current
+                    const float* key_t2 = qkv + b * sequenceLength * C3 + t2 * C3 + h * headSize + numChannels; // +numChannels because it's key
 
                     // (query_t) dot (key_t2)
                     float val = 0.0f;
-                    for (int i = 0; i < hs; i++) {
+                    for (int i = 0; i < headSize; i++) {
                         val += query_t[i] * key_t2[i];
                     }
                     val *= scale;
@@ -313,7 +372,7 @@ void attention_forward(float* out, float* preatt, float* att,
                 // pass 2: calculate the exp and keep track of sum
                 // maxval is being calculated and subtracted only for numerical stability
                 float expsum = 0.0f;
-                for (int t2 = 0; t2 <= t; t2++) {
+                for (int t2 = 0; t2 <= actual_t; t2++) {
                     float expv = expf(preatt_bth[t2] - maxval);
                     expsum += expv;
                     att_bth[t2] = expv;
@@ -321,8 +380,8 @@ void attention_forward(float* out, float* preatt, float* att,
                 float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
 
                 // pass 3: normalize to get the softmax
-                for (int t2 = 0; t2 < T; t2++) {
-                    if (t2 <= t) {
+                for (int t2 = 0; t2 <= (useCache ? currentTokenPosition : sequenceLength - 1); t2++) {
+                    if (t2 <= (useCache ? currentTokenPosition : t)) {
                         att_bth[t2] *= expsum_inv;
                     } else {
                         // causal attention mask. not strictly necessary to set to zero here
@@ -332,12 +391,14 @@ void attention_forward(float* out, float* preatt, float* att,
                 }
 
                 // pass 4: accumulate weighted values into the output of attention
-                float* out_bth = out + b * T * C + t * C + h * hs;
-                for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
-                for (int t2 = 0; t2 <= t; t2++) {
-                    float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+                float* out_bth = out + b * sequenceLength * numChannels + actual_t * numChannels + h * headSize;
+                for (int i = 0; i < headSize; i++) {
+                	out_bth[i] = 0.0f;
+                }
+                for (int t2 = 0; t2 <= actual_t; t2++) {
+                    const float* value_t2 = qkv + b * sequenceLength * C3 + t2 * C3 + h * headSize + numChannels*2; // +numChannels*2 because it's value
                     float att_btht2 = att_bth[t2];
-                    for (int i = 0; i < hs; i++) {
+                    for (int i = 0; i < headSize; i++) {
                         out_bth[i] += att_btht2 * value_t2[i];
                     }
                 }
@@ -531,7 +592,7 @@ typedef struct {
     int padded_vocab_size; // padded to e.g. %128==0, 50304
     int num_layers; // number of layers, e.g. 12
     int num_heads; // number of heads in attention, e.g. 12
-    int channels; // number of channels, e.g. 768
+    int channels; // number of channels, e.g. 768 (embedding vector)
 } GPT2Config;
 
 // the parameters of the model
@@ -564,7 +625,7 @@ void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
     param_sizes[1] = maxT * C; // wpe
     param_sizes[2] = L * C; // ln1w
     param_sizes[3] = L * C; // ln1b
-    param_sizes[4] = L * (3 * C) * C; // qkvw
+    param_sizes[4] = L * (3 * C) * C; // qkvw: input is divided across channels so you don't need to multiply by num of heads
     param_sizes[5] = L * (3 * C); // qkvb
     param_sizes[6] = L * C * C; // attprojw
     param_sizes[7] = L * C; // attprojb
@@ -707,7 +768,6 @@ typedef struct {
 } GPT2;
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
-
     // read in model from a checkpoint file
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
     int model_header[256];
@@ -764,7 +824,9 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
-void gpt2_forward(GPT2 *model, const int* inputs, int* targets, size_t B, size_t T) {
+void gpt2_forward(GPT2* model, const int* inputs, int* targets,
+	size_t batchSize, size_t sequenceLength, size_t currentToken,
+	bool useKVCache) {
     // targets are optional and could be NULL
 
     // ensure the model was initialized or error out
@@ -774,27 +836,27 @@ void gpt2_forward(GPT2 *model, const int* inputs, int* targets, size_t B, size_t
     }
 
     // convenience parameters (size_t to help prevent int overflow)
-    size_t V = model->config.vocab_size;
-    size_t Vp = model->config.padded_vocab_size;
-    size_t L = model->config.num_layers;
-    size_t NH = model->config.num_heads;
-    size_t C = model->config.channels;
+    size_t vocabSize = model->config.vocab_size;
+    size_t paddedVocabSize = model->config.padded_vocab_size;
+    size_t numLayers = model->config.num_layers;
+    size_t numHeads = model->config.num_heads;
+    size_t numChannels = model->config.channels;
 
-    // validate inputs, all indices must be in the range [0, V)
-    for(int i = 0; i < B * T; i++) {
-        assert(0 <= inputs[i] && inputs[i] < V);
+    // validate inputs, all indices must be in the range [0, vocabSize)
+    for (int i = 0; i < batchSize * sequenceLength; i++) {
+        assert(0 <= inputs[i] && inputs[i] < vocabSize);
         if (targets != NULL) {
-            assert(0 <= targets[i] && targets[i] < V);
+            assert(0 <= targets[i] && targets[i] < vocabSize);
         }
     }
 
     // allocate space for all the activations if needed (done here, lazily)
-    if(model->acts_memory == NULL) {
+    if (model->acts_memory == NULL) {
         // record the current B,T as well
-        model->batch_size = B;
-        model->seq_len = T;
+        model->batch_size = batchSize;
+        model->seq_len = sequenceLength;
         // and now allocate the space
-        fill_in_activation_sizes(model->act_sizes, model->config, B, T);
+        fill_in_activation_sizes(model->act_sizes, model->config, batchSize, sequenceLength);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
@@ -803,88 +865,118 @@ void gpt2_forward(GPT2 *model, const int* inputs, int* targets, size_t B, size_t
         model->num_activations = num_activations;
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
         // also create memory for caching inputs and targets
-        model->inputs = (int*)mallocCheck(B * T * sizeof(int));
-        model->targets = (int*)mallocCheck(B * T * sizeof(int)); // might be unused if we never have targets but it's small
+        model->inputs = (int*)mallocCheck(batchSize * sequenceLength * sizeof(int));
+        model->targets = (int*)mallocCheck(batchSize * sequenceLength * sizeof(int)); // might be unused if we never have targets but it's small
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
-        if (B != model->batch_size || T != model->seq_len) {
-            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, (int)B, (int)T);
+        if (batchSize != model->batch_size || sequenceLength != model->seq_len) {
+            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, (int)batchSize, (int)sequenceLength);
             exit(EXIT_FAILURE);
         }
     }
 
     // cache the inputs/targets
-    memcpy(model->inputs, inputs, B * T * sizeof(int));
+    memcpy(model->inputs, inputs, batchSize * sequenceLength * sizeof(int));
     if (targets != NULL) {
-        memcpy(model->targets, targets, B * T * sizeof(int));
+        memcpy(model->targets, targets, batchSize * sequenceLength * sizeof(int));
     }
 
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
     float* residual;
-    encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
-    for (int l = 0; l < L; l++) {
 
-        residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
+    if (useKVCache) {
+        assert(batchSize == 1);
+    }
+    size_t tokenCount = useKVCache ? 1 : sequenceLength; // only process new token when using cache
+    size_t tokenOffset = useKVCache ? currentToken : 0; // start from 0 unless using cache
+    size_t offset = tokenOffset * numChannels; // that token's memory location within a layer
+    size_t offsetAttention = tokenOffset * 3 * numChannels; // x3 for QKV
+    size_t offsetFeedForwardLayers = tokenOffset * 4 * numChannels; // x4 for fully connected and GELU
+
+    // when doing inference with KV cache, pass sequenceLength as 1 to only generate next token
+    // when training, pass as full sequence length
+    encoder_forward(acts.encoded + tokenOffset * batchSize * numChannels, inputs + tokenOffset, params.wte, params.wpe, batchSize, tokenCount, numChannels, tokenOffset); // encoding goes into residual[0]
+    for (int l = 0; l < numLayers; l++) {
+        residual = (l == 0 ? acts.encoded : acts.residual3 + (l-1) * batchSize * sequenceLength * numChannels) + offset;
 
         // get the pointers of the weights for this layer
-        float* l_ln1w = params.ln1w + l * C;
-        float* l_ln1b = params.ln1b + l * C;
-        float* l_qkvw = params.qkvw + l * 3*C * C;
-        float* l_qkvb = params.qkvb + l * 3*C;
-        float* l_attprojw = params.attprojw + l * C * C;
-        float* l_attprojb = params.attprojb + l * C;
-        float* l_ln2w = params.ln2w + l * C;
-        float* l_ln2b = params.ln2b + l * C;
-        float* l_fcw = params.fcw + l * 4*C * C;
-        float* l_fcb = params.fcb + l * 4*C;
-        float* l_fcprojw = params.fcprojw + l * C * 4*C;
-        float* l_fcprojb = params.fcprojb + l * C;
+        float* l_ln1w = params.ln1w + l * numChannels;
+        float* l_ln1b = params.ln1b + l * numChannels;
+        float* l_qkvw = params.qkvw + l * 3*numChannels * numChannels; // for each layer, as in architecture diagram
+        float* l_qkvb = params.qkvb + l * 3*numChannels;
+        float* l_attprojw = params.attprojw + l * numChannels * numChannels;
+        float* l_attprojb = params.attprojb + l * numChannels;
+        float* l_ln2w = params.ln2w + l * numChannels;
+        float* l_ln2b = params.ln2b + l * numChannels;
+        float* l_fcw = params.fcw + l * 4*numChannels * numChannels;
+        float* l_fcb = params.fcb + l * 4*numChannels;
+        float* l_fcprojw = params.fcprojw + l * numChannels * 4*numChannels;
+        float* l_fcprojb = params.fcprojb + l * numChannels;
 
         // get the pointers of the activations for this layer
-        float* l_ln1 = acts.ln1 + l * B * T * C;
-        float* l_ln1_mean = acts.ln1_mean + l * B * T;
-        float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        float* l_qkv = acts.qkv + l * B * T * 3*C;
-        float* l_atty = acts.atty + l * B * T * C;
-        float* l_preatt = acts.preatt + l * B * NH * T * T;
-        float* l_att = acts.att + l * B * NH * T * T;
-        float* l_attproj = acts.attproj + l * B * T * C;
-        float* l_residual2 = acts.residual2 + l * B * T * C;
-        float* l_ln2 = acts.ln2 + l * B * T * C;
-        float* l_ln2_mean = acts.ln2_mean + l * B * T;
-        float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        float* l_fch = acts.fch + l * B * T * 4*C;
-        float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
-        float* l_fcproj = acts.fcproj + l * B * T * C;
-        float* l_residual3 = acts.residual3 + l * B * T * C;
+        float* l_ln1 = acts.ln1 + l * batchSize * sequenceLength * numChannels;
+        float* l_ln1_mean = acts.ln1_mean + l * batchSize * sequenceLength;
+        float* l_ln1_rstd = acts.ln1_rstd + l * batchSize * sequenceLength;
+        float* l_qkv = acts.qkv + l * batchSize * sequenceLength * 3*numChannels;
+        float* l_atty = acts.atty + l * batchSize * sequenceLength * numChannels;
+        float* l_preatt = acts.preatt + l * batchSize * numHeads * sequenceLength * sequenceLength;
+        float* l_att = acts.att + l * batchSize * numHeads * sequenceLength * sequenceLength;
+        float* l_attproj = acts.attproj + l * batchSize * sequenceLength * numChannels;
+        float* l_residual2 = acts.residual2 + l * batchSize * sequenceLength * numChannels;
+        float* l_ln2 = acts.ln2 + l * batchSize * sequenceLength * numChannels;
+        float* l_ln2_mean = acts.ln2_mean + l * batchSize * sequenceLength;
+        float* l_ln2_rstd = acts.ln2_rstd + l * batchSize * sequenceLength;
+        float* l_fch = acts.fch + l * batchSize * sequenceLength * 4*numChannels;
+        float* l_fch_gelu = acts.fch_gelu + l * batchSize * sequenceLength * 4*numChannels;
+        float* l_fcproj = acts.fcproj + l * batchSize * sequenceLength * numChannels;
+        float* l_residual3 = acts.residual3 + l * batchSize * sequenceLength * numChannels;
 
         // now do the forward pass
-        layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-        matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-        attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
-        matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
-        residual_forward(l_residual2, residual, l_attproj, B*T*C);
-        layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
-        matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
-        gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
-        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
+        // matmul_forward is just a linear layer in the architecture diagram
+        layernorm_forward(l_ln1 + offset, l_ln1_mean + tokenOffset, l_ln1_rstd + tokenOffset, residual, l_ln1w, l_ln1b, batchSize, tokenCount, numChannels);
+        // might need to do caching here, as this is where QKV calc? need cache for each layer
+        if (useKVCache) {
+            float* current_qkv = l_qkv + offsetAttention;
+            float* current_ln1 = l_ln1 + offset;
+       		// query calculation: ordered (*Q*, K, V) in l_qkv, l_qkvw & l_qkvb
+        	cached_matmul_forward(current_qkv, current_ln1, l_qkvw, l_qkvb, batchSize, tokenCount, numChannels, numChannels);
+         	// need correct offset for key and value within l_qkv, l_qkvw & l_qkvb as QKV are all together
+          	// key calculation: +numChannels as ordered (Q, *K*, V) in l_qkv, l_qkvw & l_qkvb
+           	float* key = current_qkv + numChannels;
+       		cached_matmul_forward(key, current_ln1, l_qkvw+numChannels*numChannels, l_qkvb+numChannels, batchSize, tokenCount, numChannels, numChannels);
+         	// value calculation: +numChannels*2 as ordered (Q, K, *V*) in l_qkv, l_qkvw & l_qkvb
+          	float* value = current_qkv + numChannels*2;
+       		cached_matmul_forward(value, current_ln1, l_qkvw+numChannels*numChannels*2, l_qkvb+numChannels*2, batchSize, tokenCount, numChannels, numChannels);
+        } else {
+       		matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, batchSize, tokenCount, numChannels, 3*numChannels);
+        }
+        attention_forward(l_atty, l_preatt, l_att, l_qkv, batchSize, sequenceLength, numChannels, numHeads, useKVCache, currentToken);
+        matmul_forward(l_attproj + offset, l_atty + offset, l_attprojw, l_attprojb, batchSize, tokenCount, numChannels, numChannels);
+        residual_forward(l_residual2 + offset, residual, l_attproj + offset, batchSize*tokenCount*numChannels);
+        layernorm_forward(l_ln2 + offset, l_ln2_mean + tokenOffset, l_ln2_rstd + tokenOffset, l_residual2 + offset, l_ln2w, l_ln2b, batchSize, tokenCount, numChannels);
+        matmul_forward(l_fch + offsetFeedForwardLayers, l_ln2 + offset, l_fcw, l_fcb, batchSize, tokenCount, numChannels, 4*numChannels);
+        gelu_forward(l_fch_gelu + offsetFeedForwardLayers, l_fch + offsetFeedForwardLayers, batchSize*tokenCount*4*numChannels);
+        matmul_forward(l_fcproj + offset, l_fch_gelu + offsetFeedForwardLayers, l_fcprojw, l_fcprojb, batchSize, tokenCount, 4*numChannels, numChannels);
+        residual_forward(l_residual3 + offset, l_residual2 + offset, l_fcproj + offset, batchSize*tokenCount*numChannels);
     }
-    residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, Vp);
-    softmax_forward(acts.probs, acts.logits, B, T, V, Vp);
+    residual = (acts.residual3 + (numLayers-1) * batchSize * sequenceLength * numChannels) + offset; // last residual is in residual3
+    layernorm_forward(acts.lnf + offset, acts.lnf_mean + tokenOffset, acts.lnf_rstd + tokenOffset, residual, params.lnfw, params.lnfb, batchSize, tokenCount, numChannels);
+    matmul_forward(acts.logits + tokenOffset * paddedVocabSize, acts.lnf + offset, params.wte, NULL, batchSize, tokenCount, numChannels, paddedVocabSize);
+    softmax_forward(acts.probs + tokenOffset * paddedVocabSize, acts.logits + tokenOffset * paddedVocabSize, batchSize, tokenCount, vocabSize, paddedVocabSize);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
-        crossentropy_forward(model->acts.losses, model->acts.probs, targets, B, T, Vp);
+        crossentropy_forward(model->acts.losses, model->acts.probs, targets, batchSize, sequenceLength, paddedVocabSize);
         // for convenience also evaluate the mean loss
         float mean_loss = 0.0f;
-        for (int i=0; i<B*T; i++) { mean_loss += model->acts.losses[i]; }
-        mean_loss /= B*T;
+        #pragma omp simd
+        for (int i = 0; i < batchSize*sequenceLength; i++) {
+        	mean_loss += model->acts.losses[i];
+        }
+        mean_loss /= batchSize*sequenceLength;
         model->mean_loss = mean_loss;
     } else {
         // if we don't have targets, we don't have a loss
@@ -1077,28 +1169,27 @@ int sample_mult(float* probabilities, int n, float coin) {
 void inference(GPT2* model,
 	Tokenizer* tokenizer,
 	int* prompt,
-	const int numTokensToGenerate,
 	const int batchSize,
 	const int sequenceLength,
 	uint64_t* rng_state
 ) {
+	struct timespec start, end;
 	// now sample from the model autoregressively
 	printf("generating:\n---\n");
-	for (int t = 1; t < numTokensToGenerate; t++) {
-		// note that inference is very wasteful here because for each token
-		// we re-calculate the forward pass for all of (B,T) positions from scratch
-		// and we can maybe optimize a bit more later, with careful tests
-		gpt2_forward(model, prompt, NULL, batchSize, sequenceLength);
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (int currentToken = 0; currentToken < sequenceLength - 1; currentToken++) {
+		// this is where the key-value caching will come in
+		gpt2_forward(model, prompt, NULL, batchSize, sequenceLength, currentToken, true);
 		// furthermore, below we're only using b=0 (i.e. the first row) of all B rows
 		// we're in principle running B "inference streams" in parallel here
 		// but only using position 0
-		// get the Vp-dimensional vector probs[0, t-1, :]
-		float* probs = model->acts.probs + (t-1) * model->config.padded_vocab_size;
+		// get the Vp-dimensional vector probs[0, t, :]
+		float* probs = model->acts.probs + currentToken * model->config.padded_vocab_size;
 		float coin = random_f32(rng_state);
 		// note we're only sampling from the first V elements, ignoring padding
 		// (the probabilities in the padded region should be zero anyway)
 		int next_token = sample_mult(probs, model->config.vocab_size, coin);
-		prompt[t] = next_token;
+		prompt[currentToken+1] = next_token;
 		// print the generated token, either using the Tokenizer or a fallback
 		if (tokenizer->init_ok) {
 		    const char* token_str = tokenizer_decode(tokenizer, next_token);
@@ -1109,7 +1200,11 @@ void inference(GPT2* model,
 		}
 		fflush(stdout);
 	}
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	double time_taken_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+	printf("\nTime to generate %i tokens: %lf seconds -> %lf tokens/sec\n", sequenceLength, time_taken_s, (double)sequenceLength/time_taken_s);
 	printf("\n---\n");
+	memset(model->acts.qkv, 0, model->act_sizes[4]*sizeof(float));
 }
 
 void error_usage() {
@@ -1170,7 +1265,7 @@ void error_usage() {
 float gpt2_validate(GPT2 *model, const int* inputs, int* targets, const size_t B, const size_t T) {
     assert(targets != NULL);
     // forward the model itself
-    gpt2_forward(model, inputs, targets, B, T);
+    gpt2_forward(model, inputs, targets, B, T, 0, false);
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
     const size_t V = model->config.vocab_size;
     // note: we don't need to generate dlogits here
@@ -1187,8 +1282,8 @@ int main(int argc, char* argv[]) {
     int checkpoints_keep = 0; // how long checkpoint history do we keep? (in units of checkpoints)
     int major_checkpoint_every = 0; // major checkpoints never get deleted when maintaining history
     int resume = 0; // resume the optimization, if one is found inside output_log_dir?
-    int B = 4; // batch size
-    int T = 1024; // sequence length max
+    int batchSize = 1; // batch size 4 (i.e. 4 independent token sequences will be trained on)
+    int maxSequenceLength = 1024; // sequence length max
     int total_batch_size = -1; // will be calculated down below later, if not provided
     float learning_rate = 0.f;
     int log_gpu_every = -1;
@@ -1200,7 +1295,7 @@ int main(int argc, char* argv[]) {
     int val_loss_every = 20; // every how many steps do we eval validation loss?
     int val_max_steps = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
-    int genT = 64; // number of steps of inference we will do
+    int numInferenceSteps = 64; // number of steps of inference we will do
     int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
     int max_steps = -1;
     int override_enable_tf32 = 1;
@@ -1234,8 +1329,8 @@ int main(int argc, char* argv[]) {
         else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
         else if (argv[i][1] == 'n' && argv[i][2] == '\0') { checkpoint_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'y') { resume = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU (micro) batch size
-        else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'b') { batchSize = atoi(argv[i+1]); } // Per-GPU (micro) batch size
+        else if (argv[i][1] == 't') { maxSequenceLength = atoi(argv[i+1]); }
         else if (argv[i][1] == 'd') { total_batch_size = atoi(argv[i+1]); }
         else if (argv[i][1] == 'l' && argv[i][2] == '\0') { learning_rate = atof(argv[i+1]); }
         else if (argv[i][1] == 'l' && argv[i][2] == 'g') { log_gpu_every = atoi(argv[i+1]); }
@@ -1247,7 +1342,7 @@ int main(int argc, char* argv[]) {
         else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 's' && argv[i][2] == '\0') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g' && argv[i][2] == 'e') { gelu_fusion = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'g') { numInferenceSteps = atoi(argv[i+1]); }
         else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
         else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
@@ -1275,8 +1370,6 @@ int main(int argc, char* argv[]) {
     gpt2_build_from_checkpoint(&model, saved_model_file);
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
-
-    int batchSize = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
     int sequenceLength = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_tokens, batchSize, sequenceLength, 0, 1, 1);
@@ -1292,18 +1385,19 @@ int main(int argc, char* argv[]) {
     // some memory for generating samples from the model
     uint64_t rng_state = 1337;
     int* prompt = (int*)mallocCheck(batchSize * sequenceLength * sizeof(int));
-    const int numInferenceSteps = 64; // number of steps of inference we will do
-
+    // key-value cache
+    float* keyCache = mallocCheck(batchSize*sequenceLength*model.config.num_layers*model.config.num_heads*model.config.channels*sizeof(float));
+    float* valueCache = mallocCheck(batchSize*sequenceLength*model.config.num_layers*model.config.num_heads*model.config.channels*sizeof(float));
     // train
     struct timespec start, end;
-    for (int step = 0; step < 0; step++) {
+    for (int step = 0; step < 5; step++) {
         // once in a while estimate the validation loss
-        if (step % 10 == 0) {
+        if (false) {
             float val_loss = 0.0f;
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
-                gpt2_forward(&model, val_loader.inputs, val_loader.targets, batchSize, sequenceLength);
+                gpt2_forward(&model, val_loader.inputs, val_loader.targets, batchSize, sequenceLength, 0, false);
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
@@ -1315,28 +1409,30 @@ int main(int argc, char* argv[]) {
 		for (int i = 0; i < batchSize * sequenceLength; ++i) {
 			prompt[i] = tokenizer.eot_token;
 		}
-        inference(&model, &tokenizer, prompt, numInferenceSteps, batchSize, sequenceLength, &rng_state);
+        inference(&model, &tokenizer, prompt, batchSize, sequenceLength, &rng_state);
 
         // do a training step
+        /*
         clock_gettime(CLOCK_MONOTONIC, &start);
         dataloader_next_batch(&train_loader);
-        gpt2_forward(&model, train_loader.inputs, train_loader.targets, batchSize, sequenceLength);
+        gpt2_forward(&model, train_loader.inputs, train_loader.targets, batchSize, sequenceLength, true, keyCache, valueCache);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
         gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
         printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
+        */
     }
     // build an EvalLoader for HellaSwag
     EvalLoader eval_loader;
     const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
     const bool hellaswag_available = access(hellaswag_path, F_OK) == 0;
     printf("Hella Swag Available: %i", hellaswag_available);
-    const bool run_hellaswag = hellaswag_eval && hellaswag_available;
+    const bool run_hellaswag = false;
     if (run_hellaswag) {
     	// no multi-GPU so can set index as 0 and total as 1
-        evalloader_init(&eval_loader, hellaswag_path, B, T, 0, 1);
+        evalloader_init(&eval_loader, hellaswag_path, batchSize, maxSequenceLength, 0, 1);
         printf("| run hellaswag         | %-50s |\n", run_hellaswag ? "yes" : "no");
         puts("+-----------------------+----------------------------------------------------+\n");
 	    float eval_acc_norm = 0.0f;
@@ -1346,7 +1442,7 @@ int main(int argc, char* argv[]) {
 	        printf("evaluating HellaSwag: %d/%d\r", i, eval_loader.num_batches);
 			fflush(stdout);
 	        evalloader_next_batch(&eval_loader);
-	        gpt2_validate(&model, eval_loader.inputs, eval_loader.targets, B, T);
+	        gpt2_validate(&model, eval_loader.inputs, eval_loader.targets, batchSize, maxSequenceLength);
 	        int correct = evalloader_stat_losses(&eval_loader, model.acts.losses);
 	        eval_acc_norm += (float)correct;
 	    }
@@ -1361,6 +1457,8 @@ int main(int argc, char* argv[]) {
     tokenizer_free(&tokenizer);
     gpt2_free(&model);
     free(prompt);
+    free(keyCache);
+    free(valueCache);
     return EXIT_SUCCESS;
 }
 #endif
