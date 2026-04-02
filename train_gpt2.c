@@ -718,26 +718,6 @@ void fill_in_activation_sizes(size_t* act_sizes, GPT2Config config, int B, int T
     act_sizes[22] = B * T; // losses
 }
 
-float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) {
-    size_t num_activations = 0;
-    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-        num_activations += act_sizes[i];
-    }
-    float* acts_memory = (float*)mallocCheck(num_activations * sizeof(float));
-    float** ptrs[] = {
-        &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
-        &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
-        &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
-        &acts->lnf_mean, &acts->lnf_rstd, &acts->logits, &acts->probs, &acts->losses
-    };
-    float* acts_memory_iterator = acts_memory;
-    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-        *(ptrs[i]) = acts_memory_iterator;
-        acts_memory_iterator += act_sizes[i];
-    }
-    return acts_memory;
-}
-
 typedef struct {
     GPT2Config config;
     // the weights (parameters) of the model, and their sizes
@@ -766,6 +746,27 @@ typedef struct {
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
 } GPT2;
+
+float* malloc_and_point_activations(GPT2* model, ActivationTensors* acts, size_t* act_sizes) {
+    size_t num_activations = 0;
+    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+        num_activations += act_sizes[i];
+    }
+    model->num_activations = num_activations;
+    float* acts_memory = (float*)mallocCheck(num_activations * sizeof(float));
+    float** ptrs[] = {
+        &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
+        &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
+        &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
+        &acts->lnf_mean, &acts->lnf_rstd, &acts->logits, &acts->probs, &acts->losses
+    };
+    float* acts_memory_iterator = acts_memory;
+    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+        *(ptrs[i]) = acts_memory_iterator;
+        acts_memory_iterator += act_sizes[i];
+    }
+    return acts_memory;
+}
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     // read in model from a checkpoint file
@@ -863,7 +864,7 @@ void gpt2_forward(GPT2* model, const int* inputs, int* targets,
         }
         printf("num_activations: %zu\n", num_activations);
         model->num_activations = num_activations;
-        model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
+        model->acts_memory = malloc_and_point_activations(model, &model->acts, model->act_sizes);
         // also create memory for caching inputs and targets
         model->inputs = (int*)mallocCheck(batchSize * sequenceLength * sizeof(int));
         model->targets = (int*)mallocCheck(batchSize * sequenceLength * sizeof(int)); // might be unused if we never have targets but it's small
@@ -1000,7 +1001,7 @@ void gpt2_backward(GPT2 *model) {
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes);
-        model->grads_acts_memory = malloc_and_point_activations(&model->grads_acts, model->act_sizes);
+        model->grads_acts_memory = malloc_and_point_activations(model, &model->grads_acts, model->act_sizes);
         gpt2_zero_grad(model);
     }
 
@@ -1295,15 +1296,15 @@ int main(int argc, char* argv[]) {
     int val_loss_every = 20; // every how many steps do we eval validation loss?
     int val_max_steps = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
-    int numInferenceSteps = 64; // number of steps of inference we will do
+    int numInferenceSteps = 64; // number of steps of inference we will do / tokens will be generated
     int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
-    int max_steps = -1;
+    int max_steps = 1;
     int override_enable_tf32 = 1;
     int use_master_weights = 1;
     int gelu_fusion = 2; // 0 = none, 1 = forward, 2 = forward+backward (-1 => per-GPU default)
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
-    int hellaswag_eval = 1;
+    bool hellaswag_eval = 0;
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1370,7 +1371,7 @@ int main(int argc, char* argv[]) {
     gpt2_build_from_checkpoint(&model, saved_model_file);
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
-    int sequenceLength = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
+    int sequenceLength = numInferenceSteps; // e.g. sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_tokens, batchSize, sequenceLength, 0, 1, 1);
     dataloader_init(&val_loader, val_tokens, batchSize, sequenceLength, 0, 1, 0);
@@ -1385,12 +1386,9 @@ int main(int argc, char* argv[]) {
     // some memory for generating samples from the model
     uint64_t rng_state = 1337;
     int* prompt = (int*)mallocCheck(batchSize * sequenceLength * sizeof(int));
-    // key-value cache
-    float* keyCache = mallocCheck(batchSize*sequenceLength*model.config.num_layers*model.config.num_heads*model.config.channels*sizeof(float));
-    float* valueCache = mallocCheck(batchSize*sequenceLength*model.config.num_layers*model.config.num_heads*model.config.channels*sizeof(float));
     // train
     struct timespec start, end;
-    for (int step = 0; step < 5; step++) {
+    for (int step = 0; step < max_steps; step++) {
         // once in a while estimate the validation loss
         if (false) {
             float val_loss = 0.0f;
@@ -1410,7 +1408,7 @@ int main(int argc, char* argv[]) {
 			prompt[i] = tokenizer.eot_token;
 		}
         inference(&model, &tokenizer, prompt, batchSize, sequenceLength, &rng_state);
-
+        memset(model.acts_memory, 0, model.num_activations * sizeof(float));
         // do a training step
         /*
         clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1457,8 +1455,6 @@ int main(int argc, char* argv[]) {
     tokenizer_free(&tokenizer);
     gpt2_free(&model);
     free(prompt);
-    free(keyCache);
-    free(valueCache);
     return EXIT_SUCCESS;
 }
 #endif
