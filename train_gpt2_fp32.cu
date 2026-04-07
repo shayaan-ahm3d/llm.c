@@ -1557,6 +1557,55 @@ void error_usage() {
     exit(EXIT_FAILURE);
 }
 
+void inference(GPT2* model,
+	Tokenizer* tokenizer,
+	int* prompt,
+	const int batchSize,
+	const int sequenceLength,
+	uint64_t* rng_state,
+	FILE* timesFile
+) {
+	struct timespec start, end, ttft;
+	// now sample from the model autoregressively
+	printf("Generating:\n---\n");
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (int currentToken = 0; currentToken < sequenceLength - 1; currentToken++) {
+		// this is where the key-value caching will come in
+		gpt2_forward(model, prompt, NULL, batchSize, sequenceLength, INFERENCE, currentToken);
+		// furthermore, below we're only using b=0 (i.e. the first row) of all B rows
+		// we're in principle running B "inference streams" in parallel here
+		// but only using position 0
+		// get the Vp-dimensional vector probs[0, t, :]
+		cudaCheck(cudaMemcpy(cpu_logits, logits, model.config.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+		float coin = random_f32(rng_state);
+		// note we're only sampling from the first V elements, ignoring padding
+		// (the probabilities in the padded region should be zero anyway)
+		int next_token = sample_mult(probs, model->config.vocab_size, coin);
+		prompt[currentToken+1] = next_token;
+		// print the generated token, either using the Tokenizer or a fallback
+		if (tokenizer->init_ok) {
+		    const char* token_str = tokenizer_decode(tokenizer, next_token);
+		    safe_printf(token_str);
+		} else {
+		    // fall back to printing the token id
+		    printf("%d ", next_token);
+		}
+		fflush(stdout);
+		if (currentToken == 0) {
+			clock_gettime(CLOCK_MONOTONIC, &ttft);
+		}
+	}
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	double time_taken_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+	double timeToFirstTokenSeconds = (ttft.tv_sec - start.tv_sec) + (ttft.tv_nsec - start.tv_nsec) / 1e9;
+	write_times(timesFile, sequenceLength, time_taken_s, timeToFirstTokenSeconds);
+#ifdef DEBUG
+	printf("Time to first token: %lf s\n", timeToFirstTokenSeconds);
+	printf("\nTime to generate %i tokens: %lf s -> %lf tokens/s\n", sequenceLength, time_taken_s, (double)sequenceLength/time_taken_s);
+#endif
+	printf("\n---\n");
+}
+
 // ----------------------------------------------------------------------------
 // main training loop
 int main(int argc, char *argv[]) {
@@ -1666,7 +1715,7 @@ int main(int argc, char *argv[]) {
         int last_step = step == train_num_batches;
 
         // once in a while estimate the validation loss
-        if (step % val_loss_every == 0 || last_step) {
+        if (false) {
             float val_loss = 0.0f;
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
@@ -1680,7 +1729,7 @@ int main(int argc, char *argv[]) {
         }
 
         // once in a while do model inference to print generated text
-        if (step > 0 && step % sample_every == 0 || last_step) {
+        if (true) {
             // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
             for(int i = 0; i < B * T; ++i) {
                 gen_tokens[i] = GPT2_EOT;
@@ -1723,6 +1772,7 @@ int main(int argc, char *argv[]) {
         if (last_step) { break; }
 
         // do a training step
+        /*
         clock_gettime(CLOCK_MONOTONIC, &start);
         dataloader_next_batch(&train_loader);
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
@@ -1736,6 +1786,7 @@ int main(int argc, char *argv[]) {
         int tokens_per_second = (B * T) / time_elapsed_s;
         printf("step %4d/%d: train loss %f (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, time_elapsed_s * 1000, tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
+        */
     }
     // add a total average, for optimizations that are only mild improvements
     printf("total average iteration time: %f ms\n", total_sum_iteration_time_s / train_num_batches * 1000);
