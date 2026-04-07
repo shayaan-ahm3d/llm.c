@@ -1,10 +1,16 @@
 CC ?= clang
-CFLAGS = -Ofast -Wno-unused-result -Wno-ignored-pragmas -Wno-unknown-attributes
+CFLAGS = -Ofast -Wno-unused-result -Wno-ignored-pragmas -Wno-unknown-attributes -fno-omit-frame-pointer -g
 LDFLAGS =
-LDLIBS = -lm
+LDLIBS = -lm -lpthread
 INCLUDES =
 CFLAGS_COND = -march=native
 
+# AMD BLIS
+BLIS_PREFIX ?=/usr/local
+BLIS_INCLUDE=$(BLIS_PREFIX)/include/blis
+BLIS_LIB=$(BLIS_PREFIX)/lib/libblis.a
+INCLUDES += -I$(BLIS_INCLUDE)
+LDFLAGS += $(BLIS_LIB)
 # Find nvcc
 SHELL_UNAME = $(shell uname)
 REMOVE_FILES = rm -f
@@ -274,7 +280,7 @@ $(info ---------------------------------------------)
 all: $(TARGETS)
 
 train_gpt2: train_gpt2.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ $(LDFLAGS) $(LDLIBS) $(OUTPUT_FILE)
 
 test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
