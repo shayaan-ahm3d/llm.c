@@ -16,11 +16,13 @@ FORCE_NVCC_O ?= 3
 
 # NVCC flags
 # -t=0 is short for --threads, 0 = number of CPUs on the machine
+NVMATH_DIR ?=/opt/nvidia/hpc_sdk/Linux_x86_64/24.3/math_libs
+NVMATH_INCLUDES=$(NVMATH_DIR)/include/
+NVMATH_LIBS=$(NVMATH_DIR)/lib64/
 NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O$(FORCE_NVCC_O)
-NVCC_LDFLAGS = -lcublas -lcublasLt
-NVCC_INCLUDES =
-NVCC_LDLIBS =
-NCLL_INCUDES =
+NVCC_LDFLAGS = -L$(NVMATH_LIBS) 
+NVCC_INCLUDES = -I$(NVMATH_INCLUDES)
+NVCC_LDLIBS = -lcublas -lcublasLt
 NVCC_CUDNN =
 # By default we don't build with cudnn because it blows up compile time from a few seconds to ~minute
 USE_CUDNN ?= 0
@@ -64,7 +66,6 @@ endif
 
 # autodect a lot of various supports on current platform
 $(info ---------------------------------------------)
-
 ifneq ($(OS), Windows_NT)
   NVCC := $(shell which nvcc 2>/dev/null)
   NVCC_LDFLAGS += -lnvidia-ml
@@ -110,6 +111,9 @@ endif
 # You can override the path to cudnn frontend by setting CUDNN_FRONTEND_PATH on the make command line
 # By default, we look for it in HOME/cudnn-frontend/include and ./cudnn-frontend/include
 # Refer to the README for cuDNN install instructions
+CUDNN_DIR ?=$(HOME)/opt/cudnn-linux-x86_64-9.20.0.48_cuda13-archive
+CUDNN_INCLUDE_PATH=$(CUDNN_DIR)/include/
+CUDNN_LIB_PATH=$(CUDNN_DIR)/lib/
 ifeq ($(USE_CUDNN), 1)
   ifeq ($(SHELL_UNAME), Linux)
     ifeq ($(shell [ -d $(HOME)/cudnn-frontend/include ] && echo "exists"), exists)
@@ -121,8 +125,9 @@ ifeq ($(USE_CUDNN), 1)
     else
       $(error ✗ cuDNN not found. See the README for install instructions and the Makefile for hard-coded paths)
     endif
-    NVCC_INCLUDES += -I$(CUDNN_FRONTEND_PATH)
-    NVCC_LDFLAGS += -lcudnn
+    NVCC_INCLUDES += -I$(CUDNN_INCLUDE_PATH) -I$(CUDNN_FRONTEND_PATH)
+    NVCC_LDFLAGS += -L$(CUDNN_LIB_PATH)
+    NVCC_LDLIBS += -lcudnn
     NVCC_FLAGS += -DENABLE_CUDNN
     NVCC_CUDNN = $(BUILD_DIR)/cudnn_att.o
   else
@@ -195,6 +200,10 @@ else
 endif
 
 # Check if NCCL is available, include if so, for multi-GPU training
+NCCL_DIR ?= /opt/nvidia/hpc_sdk/Linux_x86_64/24.3/comm_libs/nccl
+NCCL_LIB_PATH = $(NCCL_DIR)/lib/
+NCCL_INCLUDE_PATH = $(NCCL_DIR)/include/
+NO_MULTI_GPU=1
 ifeq ($(NO_MULTI_GPU), 1)
   $(info → Multi-GPU (NCCL) is manually disabled)
 else
@@ -202,8 +211,10 @@ else
     # Detect if running on macOS or Linux
     ifeq ($(SHELL_UNAME), Darwin)
       $(info ✗ Multi-GPU on CUDA on Darwin is not supported, skipping NCCL support)
-    else ifeq ($(shell dpkg -l | grep -q nccl && echo "exists"), exists)
+    else ifeq ($(shell [ -d $(NCCL_LIB_PATH) ] && [ -d $(NCCL_INCLUDE_PATH) ] && echo "exists"), exists)
       $(info ✓ NCCL found, OK to train with multiple GPUs)
+      NVCC_INCLUDES += -I$(NCCL_INCLUDE_PATH)
+      NVCC_LDFLAGS += -L$(NCCL_LIB_PATH)
       NVCC_FLAGS += -DMULTI_GPU
       NVCC_LDLIBS += -lnccl
     else
@@ -214,9 +225,10 @@ else
 endif
 
 # Attempt to find and include OpenMPI on the system
-OPENMPI_DIR ?= /usr/lib/x86_64-linux-gnu/openmpi
+OPENMPI_DIR ?= /opt/nvidia/hpc_sdk/Linux_x86_64/24.3/comm_libs/openmpi/openmpi-3.1.5
 OPENMPI_LIB_PATH = $(OPENMPI_DIR)/lib/
 OPENMPI_INCLUDE_PATH = $(OPENMPI_DIR)/include/
+NO_USE_MPI=1
 ifeq ($(NO_USE_MPI), 1)
   $(info → MPI is manually disabled)
 else ifeq ($(shell [ -d $(OPENMPI_LIB_PATH) ] && [ -d $(OPENMPI_INCLUDE_PATH) ] && echo "exists"), exists)
