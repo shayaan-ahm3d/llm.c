@@ -310,8 +310,8 @@ typedef struct {
     float mean_loss; // after the last backward micro-batch, will be populated with mean loss across all GPUs and micro-steps
     float* accumulated_mean_loss; // GPU buffer used to accumulate loss across micro-steps
     float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
-    unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
-    unsigned long long rng_state_last_update; // RNG before last gpt2_update() to re-round identically from master weights
+    uint64_t rng_state; // the RNG state for seeding stochastic rounding etc.
+    uint64_t rng_state_last_update; // RNG before last gpt2_update() to re-round identically from master weights
     int use_master_weights; // keep master weights copy in float for optim update? 0|1
     bool init_state;   // set to true if master weights need to be initialized
     int gelu_fusion; // fuse gelu via cuBLASLt (0=none, 1=forward, 2=forward+backward)
@@ -754,6 +754,269 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     cudaCheck(cudaDeviceSynchronize());
 }
 
+__global__ void encoder_forward_cached_kernel(
+    floatX* output,
+    const int* tokenIdsAtPosition,
+    const floatX* weightTokenEmbeddings,
+    const floatX* weightPositionalEmbeddings,
+    const size_t sequenceLength,
+    const size_t dimensions,
+    const size_t currentToken
+) {
+    // output is (B,T,C). At each position (b,t), a C-dimensional vector summarizing token & position
+    // tokenIdsAtPosition is (B,T) of integers, holding the token ids at each (b,t) position
+    // weightTokenEmbeddings is (V,C) of token embeddings
+    // weightPositionalEmbeddings is (maxT,C) of position embeddings
+    // currentToken should be the current token for inference
+    // can process all tokens in parallel
+    
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < dimensions) { 
+	    // seek to the position in wte corresponding to the token
+	    floatX* outputPosition = output + 0*sequenceLength*dimensions + currentToken*dimensions;
+	    // get the index of the token at inp[b, t]
+        const int tokenIndex = tokenIdsAtPosition[currentToken];
+	    // seek to the position in wte corresponding to the token
+        const floatX* wte_ix = weightTokenEmbeddings + tokenIndex*dimensions;
+        // seek to the position in wpe corresponding to the position
+        const floatX* wpe_t = weightPositionalEmbeddings + currentToken*dimensions;
+        // add the two vectors and store the result in out[b,t,:]
+        outputPosition[i] = wte_ix[i] + wpe_t[i];
+    }    
+}
+
+__global__ void qkv_cache_split(
+    floatX* query,
+    floatX* key,
+    floatX* value,
+    const floatX* qkv_token,
+    const int sequenceLength,
+    const int dimensions,
+    const int headSize,
+    const int currentToken
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= dimensions) {
+        return;
+    }
+
+    const int head = i / headSize;
+    const int dimension = i % headSize;
+    const int indexInCache = head*sequenceLength*headSize + currentToken*headSize + dimension;
+
+    query[indexInCache] = qkv_token[i];
+    key[indexInCache] = qkv_token[dimensions + i];
+    value[indexInCache] = qkv_token[2*dimensions + i];
+}
+
+__global__ void attention_forward_token_kernel(
+    floatX* output,
+    floatX* attention,
+    const floatX* query,
+    const floatX* key,
+    const floatX* value,
+    const int sequenceLength,
+    const int dimensions,
+    const int numHeads,
+    const int headSize,
+    const int currentToken
+) {
+    // One block handles one attention head for B=1 decode.
+    const int head = blockIdx.x;
+    if (head >= numHeads) { return; }
+
+    extern __shared__ floatX probs[];
+    const floatX scale = rsqrtf((float)headSize);
+
+    const floatX* q_h = query + head*sequenceLength*headSize + currentToken*headSize;
+    const floatX* k_h = key + head*sequenceLength*headSize;
+    const floatX* v_h = value + head*sequenceLength*headSize;
+
+    if (threadIdx.x == 0) {
+        floatX maxval = -10000;
+        for (int t2 = 0; t2 <= currentToken; t2++) {
+            const floatX* k_t2 = k_h + t2*headSize;
+            floatX dot = 0.0f;
+            for (int d = 0; d < headSize; d++) {
+                dot += q_h[d] * k_t2[d];
+            }
+            floatX score = dot * scale;
+            probs[t2] = score;
+            maxval = fmaxf(maxval, score);
+        }
+
+        floatX expsum = 0.0f;
+        for (int t2 = 0; t2 <= currentToken; t2++) {
+            floatX p = expf(probs[t2] - maxval);
+            probs[t2] = p;
+            expsum += p;
+        }
+        floatX inv_expsum = expsum == (floatX)0.0 ? (floatX)0.0 : (floatX)1.0 / expsum;
+        for (int t2 = 0; t2 <= currentToken; t2++) {
+            probs[t2] *= inv_expsum;
+        }
+
+        if (attention != nullptr) {
+            floatX* att_row = attention + head*sequenceLength*sequenceLength + currentToken*sequenceLength;
+            for (int t2 = 0; t2 <= currentToken; t2++) {
+                att_row[t2] = (floatX)probs[t2];
+            }
+            for (int t2 = currentToken + 1; t2 < sequenceLength; t2++) {
+                att_row[t2] = (floatX)0.0f;
+            }
+        }
+    }
+    __syncthreads();
+
+    floatX* out_token = output + currentToken*dimensions + head*headSize;
+    for (int d = threadIdx.x; d < headSize; d += blockDim.x) {
+        floatX acc = 0.0f;
+        for (int t2 = 0; t2 <= currentToken; t2++) {
+            const floatX* v_t2 = v_h + t2*headSize;
+            acc += probs[t2] * v_t2[d];
+        }
+        out_token[d] = (floatX)acc;
+    }
+}
+
+__global__ void residual_add_token_kernel(floatX* output, const floatX* input1, const floatX* input2, const int dimensions) {
+    int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= dimensions) {
+        return;
+    }
+    output[c] = input1[c] + input2[c];
+}
+
+void gpt2_forward_kvcache(
+    GPT2* model,
+    const int* inputs,
+    const size_t batchSize,
+    size_t sequenceLength,
+    const size_t currentToken
+) {
+    NVTX_RANGE_FN();
+
+    // Keep a safe fallback path for unsupported cases
+    if (batchSize != 1 || currentToken >= sequenceLength || sequenceLength > (size_t)model->seq_len) {
+        gpt2_forward(model, inputs, batchSize, sequenceLength);
+        return;
+    }
+
+    const size_t vocabSize = model->config.vocab_size;
+    const size_t paddedVocabSize = model->config.padded_vocab_size;
+    const size_t numLayers = model->config.num_layers;
+    const size_t numHeads = model->config.num_heads;
+    const size_t dimensions = model->config.channels;
+    const size_t headSize = dimensions / numHeads;
+
+    tokenCheck(inputs + currentToken, 1, vocabSize);
+    cudaCheck(cudaMemcpy(model->inputs + currentToken, inputs + currentToken, sizeof(int), cudaMemcpyHostToDevice));
+
+    ParameterTensors params = model->params;
+    ActivationTensors acts = model->acts;
+
+    constexpr int threadsPerBlock = 256;
+    const int blocksPerGrid = CEIL_DIV(dimensions, threadsPerBlock);
+
+    encoder_forward_cached_kernel<<<blocksPerGrid, threadsPerBlock, 0, main_stream>>>(
+        acts.encoded, model->inputs, params.wte, params.wpe, (int)sequenceLength, (int)dimensions, (int)currentToken);
+    cudaCheck(cudaGetLastError());
+
+    for (size_t l = 0; l < numLayers; l++) {
+        floatX* residual_tok = (l == 0)
+            ? (acts.encoded + currentToken*dimensions)
+            : (acts.residual3 + (l - 1)*sequenceLength*dimensions + currentToken*dimensions);
+
+        floatX* l_ln1w = params.ln1w + l * dimensions;
+        floatX* l_ln1b = params.ln1b + l * dimensions;
+        floatX* l_qkvw = params.qkvw + l * 3 * dimensions * dimensions;
+        floatX* l_qkvb = params.qkvb + l * 3 * dimensions;
+        floatX* l_attprojw = params.attprojw + l * dimensions * dimensions;
+        floatX* l_attprojb = params.attprojb + l * dimensions;
+        floatX* l_ln2w = params.ln2w + l * dimensions;
+        floatX* l_ln2b = params.ln2b + l * dimensions;
+        floatX* l_fcw = params.fcw + l * 4 * dimensions * dimensions;
+        floatX* l_fcb = params.fcb + l * 4 * dimensions;
+        floatX* l_fcprojw = params.fcprojw + l * dimensions * 4 * dimensions;
+        floatX* l_fcprojb = params.fcprojb + l * dimensions;
+
+        floatX* l_ln1_tok = (model->recompute < 2)
+            ? (acts.ln1 + l*sequenceLength*dimensions + currentToken*dimensions)
+            : (acts.lnf + currentToken*dimensions);
+        float* l_ln1_mean_tok = acts.ln1_mean + l * sequenceLength + currentToken;
+        float* l_ln1_rstd_tok = acts.ln1_rstd + l * sequenceLength + currentToken;
+        floatX* l_qkvr = acts.qkvr + l * sequenceLength * 3 * dimensions;
+        floatX* l_atty = acts.atty + l * sequenceLength * dimensions;
+        floatX* l_att = acts.att + l * numHeads * sequenceLength * sequenceLength;
+        floatX* l_residual2_tok = acts.residual2 + l * sequenceLength * dimensions + currentToken * dimensions;
+        floatX* l_ln2_tok = (model->recompute < 2)
+            ? (acts.ln2 + l*sequenceLength*dimensions + currentToken*dimensions)
+            : (acts.lnf + currentToken*dimensions);
+        float* l_ln2_mean_tok = acts.ln2_mean + l * sequenceLength + currentToken;
+        float* l_ln2_rstd_tok = acts.ln2_rstd + l * sequenceLength + currentToken;
+        floatX* l_fch_pre_tok = acts.fch + l * sequenceLength * 4 * dimensions + currentToken*4*dimensions;
+        floatX* l_fch_gelu_tok = (model->recompute < 1)
+            ? (acts.fch_gelu + l*sequenceLength*4* dimensions + currentToken*4*dimensions)
+            : (acts.fch_gelu + currentToken*4*dimensions);
+        floatX* l_residual3_tok = acts.residual3 + l*sequenceLength*dimensions + currentToken*dimensions;
+
+        layernorm_forward(l_ln1_tok, l_ln1_mean_tok, l_ln1_rstd_tok,
+                          residual_tok, l_ln1w, l_ln1b,
+                          1, 1, (int)dimensions, main_stream);
+
+        floatX* qkv_token = (floatX*)acts.output;
+        matmul_forward_cublaslt(qkv_token, l_ln1_tok, l_qkvw, l_qkvb,
+                                1, 1, (int)dimensions, (int)(3 * dimensions), main_stream);
+
+        floatX* q = l_qkvr + 0 * sequenceLength * dimensions;
+        floatX* k = l_qkvr + 1 * sequenceLength * dimensions;
+        floatX* v = l_qkvr + 2 * sequenceLength * dimensions;
+        qkv_cache_split<<<blocksPerGrid, threadsPerBlock, 0, main_stream>>>(
+            q, k, v, qkv_token, (int)sequenceLength, (int)dimensions, (int)headSize, (int)currentToken);
+        cudaCheck(cudaGetLastError());
+
+        attention_forward_token_kernel<<<(int)numHeads, threadsPerBlock, sequenceLength * sizeof(float), main_stream>>>(
+            l_atty, l_att, q, k, v, (int)sequenceLength, (int)dimensions, (int)numHeads, (int)headSize, (int)currentToken);
+        cudaCheck(cudaGetLastError());
+
+        floatX* attproj_token = (floatX*)acts.output;
+        floatX* l_atty_tok = l_atty + currentToken * dimensions;
+        matmul_forward_cublaslt(attproj_token, l_atty_tok, l_attprojw, l_attprojb,
+                                1, 1, (int)dimensions, (int)dimensions, main_stream);
+
+        residual_add_token_kernel<<<blocksPerGrid, threadsPerBlock, 0, main_stream>>>(
+            l_residual2_tok, residual_tok, attproj_token, (int)dimensions);
+        cudaCheck(cudaGetLastError());
+
+        layernorm_forward(l_ln2_tok, l_ln2_mean_tok, l_ln2_rstd_tok,
+                          l_residual2_tok, l_ln2w, l_ln2b,
+                          1, 1, (int)dimensions, main_stream);
+
+        matmul_forward_cublaslt(l_fch_gelu_tok, l_ln2_tok, l_fcw, l_fcb,
+                                1, 1, (int)dimensions, (int)(4 * dimensions), main_stream,
+                                l_fch_pre_tok, model->gelu_fusion);
+
+        floatX* fcproj_token = (floatX*)acts.output;
+        matmul_forward_cublaslt(fcproj_token, l_fch_gelu_tok, l_fcprojw, l_fcprojb,
+                                1, 1, (int)(4 * dimensions), (int)dimensions, main_stream);
+
+        residual_add_token_kernel<<<blocksPerGrid, threadsPerBlock, 0, main_stream>>>(
+            l_residual3_tok, l_residual2_tok, fcproj_token, (int)dimensions);
+        cudaCheck(cudaGetLastError());
+    }
+
+    floatX* residual_tok = acts.residual3 + (numLayers - 1) * sequenceLength * dimensions + currentToken * dimensions;
+    floatX* lnf_tok = acts.lnf + currentToken * dimensions;
+    layernorm_forward(lnf_tok, acts.lnf_mean + currentToken, acts.lnf_rstd + currentToken,
+                      residual_tok, params.lnfw, params.lnfb,
+                      1, 1, (int)dimensions, main_stream);
+
+    floatX* logits_tok = acts.output + currentToken * paddedVocabSize;
+    matmul_forward_cublaslt(logits_tok, lnf_tok, params.wte, NULL,
+                            1, 1, (int)dimensions, (int)paddedVocabSize, main_stream);
+
+    cudaCheck(cudaDeviceSynchronize());
+}
 
 // Forwards both the model and the loss and is used for validation splits and evals.
 // In particular it populates cpu_losses with loss at each token.
@@ -1205,7 +1468,6 @@ void common_free(GPT2 &model) {
     #endif
 }
 
-
 void save_state(const char* filename, int step, GPT2* model, DataLoader* loader) {
     printf("Writing state to %s\n", filename);
     FILE *state_file = fopenCheck(filename, "wb");
@@ -1258,8 +1520,8 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     int use_master_weights = state_header[4];  // whether we're using fp32 master weights
     int should_shuffle = state_header[5]; // shuffle state of the dataloader
     *step = state_header[10]; // step of the optimization
-    model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
-    model->rng_state_last_update = *((unsigned long long*)&state_header[22]); // last gpt2_update
+    model->rng_state = *((uint64_t*)&state_header[20]); // random number generator state
+    model->rng_state_last_update = *((uint64_t*)&state_header[22]); // last gpt2_update
     size_t current_shard_idx = *((size_t*)&state_header[30]); // shard index
     size_t current_sample_idx = *((size_t*)&state_header[32]); // position in shard
 
@@ -1414,6 +1676,85 @@ void error_usage() {
     exit(EXIT_FAILURE);
 }
 
+// Open file before this
+void write_times(FILE* file, int numTokensGenerated, double totalTimeSeconds, double timeToFirstTokenSeconds) {
+	fprintf(file, "%d,%lf,%lf\n", numTokensGenerated, totalTimeSeconds, timeToFirstTokenSeconds);
+}
+
+void inference(GPT2* model,
+	Tokenizer* tokenizer,
+	int* prompt,
+	const int batchSize,
+	const int sequenceLength,
+	uint64_t* rng_state,
+    floatX* cpu_logits_raw,
+    float* cpu_logits,
+	FILE* timesFile,
+    FILE* logitsFile
+) {
+    struct timespec start, end, ttft;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (int token = 1; token < sequenceLength; token++) {
+        NvtxRange generation_range("Generation step", token);
+        // we try not to be too wasteful for inference by not calculating all of B,T
+        // Using a smaller B is always bit-for-bit identical, but T is more tricky
+        // for non-CUDNN, we need to make sure the attention buffer is memset to 0
+        // for cuDNN, it might suddenly decide to use a slightly different algorithm...
+        // on cuDNN 9.2.1 with cuDNN FrontEnd 1.5.2, T >= 256 seems bit-for-bit identical
+        // (but even if it wasn't fully identical that's probably not the end of the world)
+        // with B=1 in non-cuDNN mode we use token-by-token decode with a KV cache.
+
+#ifndef ENABLE_CUDNN
+        if (batchSize == 1) {
+            // Decode exactly one position and reuse cached K/V from previous steps
+            gpt2_forward_kvcache(model, prompt, 1, sequenceLength, token - 1);
+        } else
+#endif
+        {
+            // Fallback path for unsupported decode modes
+            gpt2_forward(model, prompt, 1, CEIL_DIV(token, min(sequenceLength,256)) * min(sequenceLength,256));
+        }
+        // get the V-dimensional vector probs[0, t-1, :]
+        floatX* logits = model->acts.output + (token - 1) * model->config.padded_vocab_size;
+        // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
+        cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model->config.vocab_size*sizeof(floatX), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaDeviceSynchronize());
+        // convert to FP32 into cpu_logits (this does nothing useful if floatX == float)
+        for (int i = 0; i < model->config.vocab_size; i++) {
+            cpu_logits[i] = (float)cpu_logits_raw[i];
+        }
+        // write logits to file to compare
+        fwrite(cpu_logits, sizeof(float), model->config.vocab_size, logitsFile);
+        // sample the next token
+        float coin = random_f32(rng_state);
+        int next_token = sample_softmax(cpu_logits, model->config.vocab_size, coin);
+        if (token == 1) clock_gettime(CLOCK_MONOTONIC, &ttft); 
+        prompt[token] = next_token;
+#define PRINT
+#ifdef PRINT 
+        // print the generated token, either using the Tokenizer or a fallback
+        if (tokenizer->init_ok) {
+            const char* token_str = tokenizer_decode(tokenizer, next_token);
+            safe_printf(token_str);
+        } else {
+            // fall back to printing the token id
+            printf("%d ", next_token);
+        }
+        fflush(stdout);
+#endif
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double timeTakenSeconds = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+	double timeToFirstTokenMillis = 1e3 * ((ttft.tv_sec - start.tv_sec) + (ttft.tv_nsec - start.tv_nsec) / 1e9);
+	write_times(timesFile, sequenceLength, timeTakenSeconds, timeToFirstTokenMillis);
+#define DEBUG
+#ifdef DEBUG
+	printf("Time to first token: %lf ms\n", timeToFirstTokenMillis);
+	printf("\nTime to generate %i tokens: %lf s -> %lf tokens/s\n", sequenceLength, timeTakenSeconds, (double)sequenceLength/timeTakenSeconds);
+#endif
+	printf("\n---\n");
+}
+
 // ----------------------------------------------------------------------------
 // main training loop
 int main(int argc, char *argv[]) {
@@ -1427,8 +1768,8 @@ int main(int argc, char *argv[]) {
     int checkpoints_keep = 0; // how long checkpoint history do we keep? (in units of checkpoints)
     int major_checkpoint_every = 0; // major checkpoints never get deleted when maintaining history
     int resume = 0; // resume the optimization, if one is found inside output_log_dir?
-    int B = 4; // batch size
-    int T = 1024; // sequence length max
+    int batchSize = 4; // batch size
+    int sequenceLength = 1024; // sequence length max
     int total_batch_size = -1; // will be calculated down below later, if not provided
     float learning_rate = 3e-4f;
     int log_gpu_every = -1;
@@ -1467,8 +1808,8 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
         else if (argv[i][1] == 'n' && argv[i][2] == '\0') { checkpoint_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'y') { resume = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU (micro) batch size
-        else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'b') { batchSize = atoi(argv[i+1]); } // Per-GPU (micro) batch size
+        else if (argv[i][1] == 't') { sequenceLength = atoi(argv[i+1]); }
         else if (argv[i][1] == 'd') { total_batch_size = atoi(argv[i+1]); }
         else if (argv[i][1] == 'l' && argv[i][2] == '\0') { learning_rate = atof(argv[i+1]); }
         else if (argv[i][1] == 'l' && argv[i][2] == 'g') { log_gpu_every = atoi(argv[i+1]); }
@@ -1509,7 +1850,7 @@ int main(int argc, char *argv[]) {
     if (output_log_dir != NULL) {
         assert(strlen(output_log_dir) < 400); // careful bunch of hardcoded snprintf around this
     }
-    int tokens_per_fwdbwd = B * T * multi_gpu_config.num_processes; // one micro-batch processes this many tokens
+    int tokens_per_fwdbwd = batchSize * sequenceLength * multi_gpu_config.num_processes; // one micro-batch processes this many tokens
     // calculate sensible default for total batch size as assuming no gradient accumulation
     if (total_batch_size == -1) { total_batch_size = tokens_per_fwdbwd; }
     // in the future, we might want to set gelu fusion to 2 for SM90+ and 0 for other GPUs
@@ -1528,8 +1869,8 @@ int main(int argc, char *argv[]) {
     printf0("| output log dir        | %-50s |\n", output_log_dir == NULL ? "NULL" : output_log_dir);
     printf0("| checkpoint_every      | %-50d |\n", checkpoint_every);
     printf0("| resume                | %-50d |\n", resume);
-    printf0("| micro batch size B    | %-50d |\n", B);
-    printf0("| sequence length T     | %-50d |\n", T);
+    printf0("| micro batch size B    | %-50d |\n", batchSize);
+    printf0("| sequence length T     | %-50d |\n", sequenceLength);
     printf0("| total batch size      | %-50d |\n", total_batch_size);
     printf0("| LR scheduler          | %-50s |\n", lr_scheduler_type);
     printf0("| learning rate (LR)    | %-50e |\n", learning_rate);
@@ -1601,8 +1942,8 @@ int main(int argc, char *argv[]) {
     // build DataLoaders for both train and val
     int permute_train_loader = (overfit_single_batch == 1) ? 0 : 1;
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, permute_train_loader);
-    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 0);
+    dataloader_init(&train_loader, train_data_pattern, batchSize, sequenceLength, multi_gpu_config.process_rank, multi_gpu_config.num_processes, permute_train_loader);
+    dataloader_init(&val_loader, val_data_pattern, batchSize, sequenceLength, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 0);
     // figure out the number of training steps we will run for
     int train_num_batches = max_steps; // passed in from command line
     if (train_num_batches == -1) {
@@ -1629,7 +1970,7 @@ int main(int argc, char *argv[]) {
     const bool hellaswag_available = access(hellaswag_path, F_OK) == 0;
     const bool run_hellaswag = hellaswag_eval && hellaswag_available;
     if (run_hellaswag) {
-        evalloader_init(&eval_loader, hellaswag_path, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+        evalloader_init(&eval_loader, hellaswag_path, batchSize, sequenceLength, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
     }
     printf0("| run hellaswag         | %-50s |\n", run_hellaswag ? "yes" : "no");
     printf0("+-----------------------+----------------------------------------------------+\n");
@@ -1650,7 +1991,7 @@ int main(int argc, char *argv[]) {
     printf0("allocated %d MiB for model parameters\n", (int)round(model.num_parameters_bytes / (1024 * 1024)));
     // few more prints for gradient accumulation math up above
     printf0("batch_size B=%d * seq_len T=%d * num_processes=%d and total_batch_size=%d\n",
-            B, T, multi_gpu_config.num_processes, total_batch_size);
+            batchSize, sequenceLength, multi_gpu_config.num_processes, total_batch_size);
     printf0("=> setting grad_accum_steps=%d\n", grad_accum_steps);
 
     // set up logging
@@ -1668,13 +2009,13 @@ int main(int argc, char *argv[]) {
                       warmup_iterations, train_num_batches, final_learning_rate_frac);
 
     // some memory for generating samples from the model
-    int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
+    int* prompt = (int*)mallocCheck(batchSize * sequenceLength * sizeof(int));
     floatX* cpu_logits_raw = (floatX*)mallocCheck(model.config.vocab_size * sizeof(floatX));
     float*  cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
     // if we found a checkpoint to resume from, load the optimization state
     int step = 0;
-    gpt2_allocate_state(&model, B, T);
+    gpt2_allocate_state(&model, batchSize, sequenceLength);
     if (resuming == 1) {
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, resume_max_step, multi_gpu_config.process_rank);
         load_state(&step, &model, &train_loader, filename_buffer);
@@ -1687,10 +2028,10 @@ int main(int argc, char *argv[]) {
 
     // do some checks here before we kick off training
     // cross-check the desired sequence length T with the model's max sequence length
-    if (T < model.config.max_seq_len) {
+    if (sequenceLength < model.config.max_seq_len) {
         printf0("!!!!!!!!\n");
         printf0("WARNING:\n");
-        printf0("- The training sequence length is: T=%d (set with -t)\n", T);
+        printf0("- The training sequence length is: T=%d (set with -t)\n", sequenceLength);
         printf0("- The model's max sequence length is: max_seq_len=%d\n", model.config.max_seq_len);
         printf0("You are attempting to train with a sequence length shorter than the model's max.\n");
         printf0("This will lead to unused parameters in the wpe position embedding weights.\n");
@@ -1700,9 +2041,14 @@ int main(int argc, char *argv[]) {
         printf0("!!!!!!!!\n");
     }
     // in any case, this must be true or we'd index beyond the model's wpe (position embedding table)
-    assert(T <= model.config.max_seq_len);
+    assert(sequenceLength <= model.config.max_seq_len);
 
     // train
+    const char* GPU_TIMES = "gpu_times.csv";
+    const char* GPU_LOGITS = "gpu_logits.log";
+    FILE* timeFile = fopenCheck(GPU_TIMES, "a");
+    FILE* logitsFile = fopenCheck(GPU_LOGITS, "a");
+    uint64_t sample_rng_state = 1337;
     cudaEvent_t start, end;
     cudaCheck(cudaEventCreate(&start));
     cudaCheck(cudaEventCreate(&end));
@@ -1721,7 +2067,7 @@ int main(int argc, char *argv[]) {
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
-                val_loss += gpt2_validate(&model, val_loader.inputs, val_loader.targets, B, T);
+                val_loss += gpt2_validate(&model, val_loader.inputs, val_loader.targets, batchSize, sequenceLength);
             }
             val_loss /= val_num_batches;
             val_loss = multi_gpu_cpu_float_sum(val_loss, &multi_gpu_config) / multi_gpu_config.num_processes;
@@ -1738,7 +2084,7 @@ int main(int argc, char *argv[]) {
             for (int i = 0; i < eval_loader.num_batches; i++) {
                 if (i % 10 == 0) { printf("evaluating HellaSwag: %d/%d\r", i, eval_loader.num_batches); }
                 evalloader_next_batch(&eval_loader);
-                gpt2_validate(&model, eval_loader.inputs, eval_loader.targets, B, T);
+                gpt2_validate(&model, eval_loader.inputs, eval_loader.targets, batchSize, sequenceLength);
                 int correct = evalloader_stat_losses(&eval_loader, model.cpu_losses);
                 eval_acc_norm += (float)correct;
             }
@@ -1752,47 +2098,14 @@ int main(int argc, char *argv[]) {
         if (multi_gpu_config.process_rank == 0 && sample_every > 0 &&
            (step > 0 && (step % sample_every) == 0 || last_step)) {
             NvtxRange generation_range("generation");
-            unsigned long long sample_rng_state = 1337;
             // fill up gen_tokens with the <|endoftext|> token, which kicks off the generation
             int eot_token = tokenizer.eot_token;
-            for(int i = 0; i < B * T; ++i) {
-                gen_tokens[i] = eot_token;
+            for(int i = 0; i < batchSize * sequenceLength; ++i) {
+                prompt[i] = eot_token;
             }
             // now sample from the model autoregressively
-            printf("generating:\n---\n");
-            for (int t = 1; t < genT; t++) {
-                NvtxRange generation_range("Generation step", t);
-                // we try not to be too wasteful for inference by not calculating all of B,T
-                // Using a smaller B is always bit-for-bit identical, but T is more tricky
-                // for non-CUDNN, we need to make sure the attention buffer is memset to 0
-                // for cuDNN, it might suddenly decide to use a slightly different algorithm...
-                // on cuDNN 9.2.1 with cuDNN FrontEnd 1.5.2, T >= 256 seems bit-for-bit identical
-                // (but even if it wasn't fully identical that's probably not the end of the world)
-                // note this is still somewhat wasteful because we don't have a KV cache!
-                gpt2_forward(&model, gen_tokens, 1, CEIL_DIV(t, min(T,256)) * min(T,256));
-                // get the V-dimensional vector probs[0, t-1, :]
-                floatX* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
-                // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
-                cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model.config.vocab_size * sizeof(floatX), cudaMemcpyDeviceToHost));
-                // convert to FP32 into cpu_logits (this does nothing useful if floatX == float)
-                for (int i = 0; i < model.config.vocab_size; i++) {
-                    cpu_logits[i] = (float)cpu_logits_raw[i];
-                }
-                // sample the next token
-                float coin = random_f32(&sample_rng_state);
-                int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
-                gen_tokens[t] = next_token;
-                // print the generated token, either using the Tokenizer or a fallback
-                if (tokenizer.init_ok) {
-                    const char* token_str = tokenizer_decode(&tokenizer, next_token);
-                    safe_printf(token_str);
-                } else {
-                    // fall back to printing the token id
-                    printf("%d ", next_token);
-                }
-                fflush(stdout);
-            }
-            printf("\n---\n");
+		    memset(model.acts_memory, 0, NUM_ACTIVATION_TENSORS*sizeof(floatX));
+            inference(&model, &tokenizer, prompt, batchSize, sequenceLength, &sample_rng_state, cpu_logits_raw, cpu_logits, timeFile, logitsFile);
         }
 
         // once in a while checkpoint the optimization state (all ranks)
@@ -1830,7 +2143,7 @@ int main(int argc, char *argv[]) {
             // fetch the next data batch
             dataloader_next_batch(&train_loader);
             // forward pass. note that we pass in grad_accum_steps, which scales down the loss
-            gpt2_forward(&model, train_loader.inputs, B, T);
+            gpt2_forward(&model, train_loader.inputs, batchSize, sequenceLength);
             // backward pass. all model params accumulate gradients with += inside this inner loop
             gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
         }
@@ -1859,7 +2172,7 @@ int main(int argc, char *argv[]) {
         // todo - move or double-buffer all of this timing logic to avoid idling the GPU at this point!
         float time_elapsed_ms;
         cudaCheck(cudaEventElapsedTime(&time_elapsed_ms, start, end));
-        size_t tokens_processed = (size_t)multi_gpu_config.num_processes * B * T * grad_accum_steps;
+        size_t tokens_processed = (size_t)multi_gpu_config.num_processes * batchSize * sequenceLength * grad_accum_steps;
         float tokens_per_second = tokens_processed / time_elapsed_ms * 1000.0f;
         float bias_corrected_ema_tokens_per_second = tokens_per_second; // by default set to non-ema version
         if (step > 0) { // consider the first batch to be a warmup (e.g. cuBLAS/cuDNN initialisation)
@@ -1868,10 +2181,11 @@ int main(int argc, char *argv[]) {
             ema_tokens_per_second = 0.95f * ema_tokens_per_second + 0.05f * tokens_per_second;
             bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
-        float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
-        printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
+        float mfu = gpt2_estimate_mfu(&model, batchSize * sequenceLength * grad_accum_steps, time_elapsed_ms / 1000.0f);
+        /*printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
                 step + 1, train_num_batches, model.mean_loss, zloss, grad_norm, zgrad, step_learning_rate,
                 time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
+        */
         if(log_gpu_every > 0 && (step + 1) % log_gpu_every == 0) {
             GPUUtilInfo gpu_info = get_gpu_utilization_info();
             printf0("                  compute %2.1f%% | memory: %2.1f%% | fan: %2d%% | %4d MHz / %4d MHz | %3d W / %3d W | %d°C / %d°C | %s\n",
@@ -1895,10 +2209,12 @@ int main(int argc, char *argv[]) {
     tokenizer_free(&tokenizer);
     free(cpu_logits_raw);
     free(cpu_logits);
-    free(gen_tokens);
+    free(prompt);
     multi_gpu_config_free(&multi_gpu_config);
     gpt2_free(&model);
     common_free(model);
-    return 0;
+    fcloseCheck(timeFile);
+    fcloseCheck(logitsFile);
+    return EXIT_SUCCESS;
 }
 #endif

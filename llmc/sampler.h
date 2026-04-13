@@ -7,7 +7,7 @@ Implements a simple Sampler, used during model inference to sample tokens.
 #include <math.h>
 
 // Simple xorshift RNG
-unsigned int random_u32(unsigned long long *state) {
+unsigned int random_u32(uint64_t* state) {
     // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
     *state ^= *state >> 12;
     *state ^= *state << 25;
@@ -15,22 +15,28 @@ unsigned int random_u32(unsigned long long *state) {
     return (*state * 0x2545F4914F6CDD1Dull) >> 32;
 }
 
-float random_f32(unsigned long long *state) { // random float32 in [0,1)
+float random_f32(uint64_t* state) { // random float32 in [0,1)
     return (random_u32(state) >> 8) / 16777216.0f;
 }
 
 int sample_softmax(const float* logits, int n, float coin) {
     // sample index from logits (converted to probabilities using softmax)
     // coin is a random number in [0, 1), usually from random_f32()
+    float maxval = -10000.f;
+    for (int i = 0; i < n; i++) {
+        if (logits[i] > maxval) {
+            maxval = logits[i];
+        }
+    }
     double norm = 0;
     for (int i = 0; i < n; i++) {
-        norm += expf(logits[i]);
+        norm += expf(logits[i] - maxval);
     }
     // instead of dividing all exp(logits), we can just multiply coin.
     coin *= norm;
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
-        cdf += expf(logits[i]);
+        cdf += expf(logits[i] - maxval);
         if (coin < cdf) {
             return i;
         }

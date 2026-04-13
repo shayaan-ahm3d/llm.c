@@ -20,7 +20,7 @@ There will be other versions of this code that specialize it and make it fast.
 #ifdef OMP
 #include <omp.h>
 #endif
-#include <blis/blis.h>
+#include <blis.h>
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 #include "llmc/utils.h"
@@ -503,6 +503,7 @@ void cached_matmul_forward(
 ) {
 	assert(mode == INFERENCE);
     assert(dimensions == outputDimensions);
+    #pragma omp parallel for
     for (int sequence = 0; sequence < batchSize; ++sequence) {
     	// use 3*dimensions so it goes over the QKV to get to the next token, otherwise would index into wrong thing
     	// fill that cache line with the bias values already
@@ -563,6 +564,7 @@ void attention_forward(
 	                    // pass 1: calculate query dot key and maxval
 	                    float maxval = -10000.0f; // TODO something better
 	                    // this loop iterates over all previous elements in K
+                        #pragma omp simd
 	                    for (int t2 = 0; t2 <= token; t2++) {
 	                    	// query is t but key is t2 as key requires full history of previous tokens, whereas query just requires current
 	                        const float* key_t2 = qkv + sequence*sequenceLength*C3 + t2*C3 + head*headSize + dimensions; // +dimensions because it's key
@@ -583,6 +585,7 @@ void attention_forward(
 	                    // pass 2: calculate the exp and keep track of sum
 	                    // maxval is being calculated and subtracted only for numerical stability
 	                    float expsum = 0.0f;
+                        #pragma omp simd
 	                    for (int t2 = 0; t2 <= token; t2++) {
 	                        float expv = expf(preatt_bth[t2] - maxval);
 	                        expsum += expv;
@@ -591,6 +594,7 @@ void attention_forward(
 	                    float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
 
 	                    // pass 3: normalize to get the softmax
+                        #pragma omp simd
 	                    for (int t2 = 0; t2 <= sequenceLength - 1; t2++) {
 	                        if (t2 <= token) {
 	                            att_bth[t2] *= expsum_inv;
@@ -603,13 +607,15 @@ void attention_forward(
 
 	                    // pass 4: accumulate weighted values into the output of attention
 	                    float* out_bth = out + sequence*sequenceLength*dimensions + token*dimensions + head*headSize;
-	                    for (int i = 0; i < headSize; i++) {
+	                    #pragma omp simd
+                        for (int i = 0; i < headSize; i++) {
 	                    	out_bth[i] = 0.0f;
 	                    }
+                        #pragma omp simd collapse(2)
 	                    for (int t2 = 0; t2 <= token; t2++) {
-	                        const float* value_t2 = qkv + sequence*sequenceLength*C3 + t2*C3 + head*headSize + dimensions*2; // +dimensions*2 because it's value
-	                        const float att_btht2 = att_bth[t2];
 	                        for (int i = 0; i < headSize; i++) {
+	                            const float att_btht2 = att_bth[t2];
+	                            const float* value_t2 = qkv + sequence*sequenceLength*C3 + t2*C3 + head*headSize + dimensions*2; // +dimensions*2 because it's value
 	                            out_bth[i] += att_btht2 * value_t2[i];
 	                        }
 	                    }
@@ -629,6 +635,7 @@ void attention_forward(
                     // pass 1: calculate query dot key and maxval
                     float maxval = -10000.0f; // TODO something better
                     // this loop iterates over all previous elements in K
+                    #pragma omp simd
                     for (int t2 = 0; t2 <= currentToken; t2++) {
                     	// query is t but key is t2 as key requires full history of previous tokens, whereas query just requires current
                         const float* key_t2 = qkv + sequence*sequenceLength*C3 + t2*C3 + head*headSize + dimensions; // +dimensions because it's key
@@ -649,6 +656,7 @@ void attention_forward(
                     // pass 2: calculate the exp and keep track of sum
                     // maxval is being calculated and subtracted only for numerical stability
                     float expsum = 0.0f;
+                    #pragma omp simd
                     for (int t2 = 0; t2 <= currentToken; t2++) {
                         float expv = expf(preatt_bth[t2] - maxval);
                         expsum += expv;
@@ -657,6 +665,7 @@ void attention_forward(
                     float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
 
                     // pass 3: normalize to get the softmax
+                    #pragma omp simd
                     for (int t2 = 0; t2 <= currentToken; t2++) {
                         if (t2 <= currentToken) {
                             att_bth[t2] *= expsum_inv;
@@ -669,13 +678,15 @@ void attention_forward(
 
                     // pass 4: accumulate weighted values into the output of attention
                     float* out_bth = out + sequence*sequenceLength*dimensions + currentToken*dimensions + head*headSize;
+                    #pragma omp simd
                     for (int i = 0; i < headSize; i++) {
                     	out_bth[i] = 0.0f;
                     }
+                    #pragma omp simd collapse(2)
                     for (int t2 = 0; t2 <= currentToken; t2++) {
-                        const float* value_t2 = qkv + sequence*sequenceLength*C3 + t2*C3 + head*headSize + dimensions*2; // +dimensions*2 because it's value
-                        const float att_btht2 = att_bth[t2];
                         for (int i = 0; i < headSize; i++) {
+                            const float* value_t2 = qkv + sequence*sequenceLength*C3 + t2*C3 + head*headSize + dimensions*2; // +dimensions*2 because it's value
+                            const float att_btht2 = att_bth[t2];
                             out_bth[i] += att_btht2 * value_t2[i];
                         }
                     }
@@ -955,16 +966,16 @@ void crossentropy_forward(
        			for (int token = 0; token < sequenceLength; token++) {
 	            	// loss = -log(probs[target])
 		            const float* probs_bt = probs + sequence*sequenceLength*paddedVocabSize + token*paddedVocabSize;
-		            const int index = targets[sequence*sequenceLength + token];
-		            losses[sequence*sequenceLength + token] = -logf(probs_bt[index]);
+		            const int targetToken = targets[sequence*sequenceLength + token];
+		            losses[sequence*sequenceLength + token] = -logf(probs_bt[targetToken]);
           		}
           		break;
        		}
        		case INFERENCE: { // only process currentToken
 	            // loss = -log(probs[target])
 		        const float* probs_bt = probs + sequence*sequenceLength*paddedVocabSize + currentToken*paddedVocabSize;
-		        const int index = targets[sequence*sequenceLength + currentToken];
-		        losses[sequence*sequenceLength + currentToken] = -logf(probs_bt[index]);
+		        const int targetToken = targets[sequence*sequenceLength + currentToken];
+		        losses[sequence*sequenceLength + currentToken] = -logf(probs_bt[targetToken]);
 				break;
          	}
      	}
@@ -1234,13 +1245,57 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
+typedef struct {
+    float cpuLoss;
+    float gpuLoss;
+} Losses;
+
+Losses compare_implementations(
+    FILE* cpu,
+    FILE* gpu,
+    const int* targets, // from HellaSwag
+    const int batchSize,
+    const int sequenceLength,
+    const int vocabSize,
+    const int paddedVocabSize
+) {
+    const size_t n = batchSize*sequenceLength*vocabSize;
+    const size_t N = batchSize*sequenceLength*paddedVocabSize;
+    
+    float* cpuLogits = malloc(sizeof(float)*n);
+    float* gpuLogits = malloc(sizeof(float)*n);
+
+    float* cpuProbs = malloc(sizeof(float)*N);
+    float* gpuProbs = malloc(sizeof(float)*N);
+    float* cpuLosses = malloc(sizeof(float)*N);
+    float* gpuLosses = malloc(sizeof(float)*N);
+
+    fread(cpuLogits, sizeof(float), n, cpu); 
+    fread(gpuLogits, sizeof(float), n, gpu);
+    
+    softmax_forward(cpuProbs, cpuLogits, batchSize, sequenceLength, vocabSize, paddedVocabSize, TRAIN_VAL, 0);
+    softmax_forward(gpuProbs, gpuLogits, batchSize, sequenceLength, vocabSize, paddedVocabSize, TRAIN_VAL, 0);
+
+    crossentropy_forward(cpuLosses, cpuProbs, targets, batchSize, sequenceLength, paddedVocabSize, TRAIN_VAL, 0);
+    crossentropy_forward(gpuLosses, gpuProbs, targets, batchSize, sequenceLength, paddedVocabSize, TRAIN_VAL, 0);
+    
+    float cpuLoss = 0.f;
+    float gpuLoss = 0.f;
+    for (size_t i = 0; i < N; ++i) {
+        cpuLoss += cpuLosses[i];
+        gpuLoss += gpuLosses[i];
+    }
+    return (Losses){.cpuLoss=cpuLoss, .gpuLoss=gpuLoss};
+}
+
 void gpt2_forward(GPT2* model,
 	const int* inputs,
 	int* targets, // targets are optional and could be NULL
 	const size_t batchSize,
 	const size_t sequenceLength,
 	const enum Mode mode,
-	const size_t currentToken
+	const size_t currentToken,
+    FILE* const logitsFile 
 ) {
     // ensure the model was initialized or error out
     if (model->params_memory == NULL) {
@@ -1390,7 +1445,9 @@ void gpt2_forward(GPT2* model,
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, batchSize, sequenceLength, dimensions, mode, currentToken);
     matmul_forward(acts.logits, acts.lnf, params.wte, NULL, batchSize, sequenceLength, dimensions, paddedVocabSize, mode, currentToken);
     softmax_forward(acts.probs, acts.logits, batchSize, sequenceLength, vocabSize, paddedVocabSize, mode, currentToken);
-
+    if (logitsFile != NULL) {
+        fwrite(acts.logits, sizeof(float), batchSize*sequenceLength*paddedVocabSize, logitsFile);
+    }
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
         crossentropy_forward(model->acts.losses, model->acts.probs, targets, batchSize, sequenceLength, paddedVocabSize, mode, currentToken);
@@ -1615,7 +1672,8 @@ void inference(GPT2* model,
 	const int batchSize,
 	const int sequenceLength,
 	uint64_t* rng_state,
-	FILE* timesFile
+	FILE* timesFile,
+    FILE* logitsFile
 ) {
 	struct timespec start, end, ttft;
 	// now sample from the model autoregressively
@@ -1623,7 +1681,7 @@ void inference(GPT2* model,
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	for (int currentToken = 0; currentToken < sequenceLength - 1; currentToken++) {
 		// this is where the key-value caching will come in
-		gpt2_forward(model, prompt, NULL, batchSize, sequenceLength, INFERENCE, currentToken);
+		gpt2_forward(model, prompt, NULL, batchSize, sequenceLength, INFERENCE, currentToken, logitsFile);
 		// furthermore, below we're only using b=0 (i.e. the first row) of all B rows
 		// we're in principle running B "inference streams" in parallel here
 		// but only using position 0
@@ -1633,7 +1691,11 @@ void inference(GPT2* model,
 		// note we're only sampling from the first V elements, ignoring padding
 		// (the probabilities in the padded region should be zero anyway)
 		int next_token = sample_mult(probs, model->config.vocab_size, coin);
+        if (currentToken == 0) {
+			clock_gettime(CLOCK_MONOTONIC, &ttft);
+		}
 		prompt[currentToken+1] = next_token;
+#ifdef PRINT
 		// print the generated token, either using the Tokenizer or a fallback
 		if (tokenizer->init_ok) {
 		    const char* token_str = tokenizer_decode(tokenizer, next_token);
@@ -1643,17 +1705,16 @@ void inference(GPT2* model,
 		    printf("%d ", next_token);
 		}
 		fflush(stdout);
-		if (currentToken == 0) {
-			clock_gettime(CLOCK_MONOTONIC, &ttft);
-		}
+#endif
 	}
 	clock_gettime(CLOCK_MONOTONIC, &end);
-	double time_taken_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-	double timeToFirstTokenSeconds = (ttft.tv_sec - start.tv_sec) + (ttft.tv_nsec - start.tv_nsec) / 1e9;
-	write_times(timesFile, sequenceLength, time_taken_s, timeToFirstTokenSeconds);
+	double timeTakenSeconds = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+	double timeToFirstTokenMillis = 1e3 * ((ttft.tv_sec - start.tv_sec) + (ttft.tv_nsec - start.tv_nsec) / 1e9);
+	write_times(timesFile, sequenceLength, timeTakenSeconds, timeToFirstTokenMillis);
+#define DEBUG
 #ifdef DEBUG
-	printf("Time to first token: %lf s\n", timeToFirstTokenSeconds);
-	printf("\nTime to generate %i tokens: %lf s -> %lf tokens/s\n", sequenceLength, time_taken_s, (double)sequenceLength/time_taken_s);
+	printf("Time to first token: %lf ms\n", timeToFirstTokenMillis);
+	printf("\nTime to generate %i tokens: %lf s -> %lf tokens/s\n", sequenceLength, timeTakenSeconds, (double)sequenceLength/timeTakenSeconds);
 #endif
 	printf("\n---\n");
 }
@@ -1716,7 +1777,7 @@ void error_usage() {
 float gpt2_validate(GPT2* model, const int* inputs, int* targets, const size_t batchSize, const size_t sequenceLength) {
     assert(targets != NULL);
     // forward the model itself
-    gpt2_forward(model, inputs, targets, batchSize, sequenceLength, TRAIN_VAL, 0);
+    gpt2_forward(model, inputs, targets, batchSize, sequenceLength, TRAIN_VAL, 0, NULL);
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
     const size_t vocabSize = model->config.vocab_size;
     // note: we don't need to generate dlogits here
@@ -1769,8 +1830,8 @@ int main(int argc, char* argv[]) {
     const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
     const char* saved_model_file = "gpt2_124M.bin";
-    const char* time_file = "cpu_times.csv";
-
+    const char* CPU_TIMES = "cpu_times.csv";
+    const char* CPU_LOGITS = "cpu_logits.log";
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -1815,8 +1876,10 @@ int main(int argc, char* argv[]) {
         else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
         else { error_usage(); }
     }
-    FILE* times = fopenCheck(time_file, "a");
 
+    FILE* timeFile = fopenCheck(CPU_TIMES, "ab");
+    FILE* logitsFile = fopenCheck(CPU_LOGITS, "ab");
+    
     Logger logger;
     logger_init(&logger, output_log_dir, 0, resume);
 
@@ -1836,7 +1899,6 @@ int main(int argc, char* argv[]) {
     // build the Tokenizer
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
-
     // some memory for generating samples from the model
     uint64_t rng_state = 1337;
     int* prompt = (int*)mallocCheck(batchSize * sequenceLength * sizeof(int));
@@ -1849,7 +1911,7 @@ int main(int argc, char* argv[]) {
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
-                gpt2_forward(&model, val_loader.inputs, val_loader.targets, batchSize, sequenceLength, TRAIN_VAL, 0);
+                gpt2_forward(&model, val_loader.inputs, val_loader.targets, batchSize, sequenceLength, TRAIN_VAL, 0, NULL);
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
@@ -1862,7 +1924,7 @@ int main(int argc, char* argv[]) {
 			prompt[i] = tokenizer.eot_token;
 		}
 		memset(model.acts_memory, 0, model.num_activations * sizeof(float));
-        inference(&model, &tokenizer, prompt, batchSize, sequenceLength, &rng_state, times);
+        inference(&model, &tokenizer, prompt, batchSize, sequenceLength, &rng_state, timeFile, logitsFile);
         // do a training step
         /*
         clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1882,13 +1944,25 @@ int main(int argc, char* argv[]) {
     const bool hellaswag_available = access(hellaswag_path, F_OK) == 0;
     const bool run_hellaswag = hellaswag_eval && hellaswag_available;
     if (run_hellaswag) {
+        const char* GPU_LOGITS = "gpu_logits.log";
+        FILE* gpuLogits = fopenCheck(GPU_LOGITS, "rb");
+        int* correctTokens = (int*)malloc(sizeof(int)*eval_loader.T*eval_loader.B*4);
     	// no multi-GPU so can set index as 0 and total as 1
         evalloader_init(&eval_loader, hellaswag_path, batchSize, maxSequenceLength, 0, 1);
         printf("| run hellaswag         | %-50s |\n", run_hellaswag ? "yes" : "no");
         puts("+-----------------------+----------------------------------------------------+\n");
 	    float eval_acc_norm = 0.0f;
 	    evalloader_reset(&eval_loader);
-		printf("Num Batches: %i\n", eval_loader.num_batches);
+        
+        const int numberOfCompletions = evalloader_get_correct_completion(correctTokens, &eval_loader);
+        for (int sequence = 0; sequence < numberOfCompletions; ++sequence) {
+            int* currentTarget = correctTokens + sequence*sequenceLength;
+            Losses results = compare_implementations(logitsFile, gpuLogits, currentTarget, 1, sequenceLength, model.config.vocab_size, model.config.padded_vocab_size);
+            printf("CPU: %lf\n", results.cpuLoss);
+            printf("GPU: %lf\n", results.gpuLoss);
+        }
+		
+        printf("Num Batches: %i\n", eval_loader.num_batches);
 	    for (int i = 0; i < eval_loader.num_batches; i++) { // each batch has the 4 possible completion
 #ifdef DEBUG
 	        printf("evaluating HellaSwag: %d/%d\r", i, eval_loader.num_batches);
@@ -1899,6 +1973,8 @@ int main(int argc, char* argv[]) {
 	        int correct = evalloader_stat_losses(&eval_loader, model.acts.losses);
 	        eval_acc_norm += (float)correct;
 	    }
+        fcloseCheck(gpuLogits);
+        free(correctTokens);
 	    printf("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
     }
     // free
@@ -1910,7 +1986,8 @@ int main(int argc, char* argv[]) {
     tokenizer_free(&tokenizer);
     gpt2_free(&model);
     free(prompt);
-    fcloseCheck(times);
+    fcloseCheck(timeFile);
+    fcloseCheck(logitsFile);
     return EXIT_SUCCESS;
 }
 #endif

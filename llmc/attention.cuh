@@ -147,6 +147,11 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
         float ev = expf(inv_temperature * ((float)__ldcs(x + i) - global_maxval));
         __stcs(out + idx * T + i, (floatX)(ev * norm));
     }
+    // for extra super safety we may wish to include this too,
+	// forcing the probabilities here to be zero, but it shouldn't matter
+    for (int i = own_pos + 1 + lane_id; i < T; i += WARP_SIZE) {
+        __stcs(out + idx * T + i, (floatX)0.0f);
+    }
 }
 
 __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, const floatX* att,

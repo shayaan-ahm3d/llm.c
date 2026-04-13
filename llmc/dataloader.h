@@ -465,6 +465,31 @@ void evalloader_next_batch(EvalLoader *loader) {
     }
 }
 
+// Returns number of examples
+int evalloader_get_correct_completion(int* output, const EvalLoader* loader) {
+    // Calculate how many examples are currently in the batch
+    int can_fit_examples = loader->B / ASSUMED_NUM_COMPLETIONS;
+
+    for (int i = 0; i < can_fit_examples; ++i) {
+        int correctLabel = loader->label[i];
+        int rowIndex = i * ASSUMED_NUM_COMPLETIONS + correctLabel;
+        int tokenCount = 0;
+        for (int t = 0; t < loader->T; t++) {
+            // The mask is 1 only at the positions of the completion tokens
+            if (loader->mask[rowIndex * loader->T + t] == 1) {
+                output[i * loader->T + tokenCount] = loader->targets[rowIndex * loader->T + t];
+                tokenCount++;
+            }
+        }
+        
+        // pad remainder with -1
+        for (int t = tokenCount; t < loader->T; t++) {
+            output[i * loader->T + t] = -1;
+        }
+    }
+    return can_fit_examples;
+}
+
 int evalloader_stat_losses(EvalLoader *loader, float* losses) {
     // compute statistics of losses (B*T) resulting from a forward pass
     // on a batch that was constructed from EvalLoader
