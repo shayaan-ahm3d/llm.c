@@ -1,14 +1,13 @@
 CC ?= clang
-CFLAGS = -Ofast -Wno-unused-result -Wno-ignored-pragmas -Wno-unknown-attributes -fno-omit-frame-pointer -g
-LDFLAGS =
+CFLAGS = -O3 -Wno-unused-result -Wno-ignored-pragmas -Wno-unknown-attributes
 LDLIBS = -lm -lpthread
 INCLUDES =
 CFLAGS_COND = -march=native
 
 # AMD BLIS
-BLIS_PREFIX ?=/usr/local
+BLIS_PREFIX ?=$(HOME)/local
 BLIS_INCLUDE=$(BLIS_PREFIX)/include/blis
-BLIS_LIB=$(BLIS_PREFIX)/lib/libblis.a
+BLIS_LIB=$(BLIS_PREFIX)/lib/libblis-mt.a
 INCLUDES += -I$(BLIS_INCLUDE)
 LDFLAGS += $(BLIS_LIB)
 # Find nvcc
@@ -25,7 +24,7 @@ FORCE_NVCC_O ?= 3
 NVMATH_DIR ?=/opt/nvidia/hpc_sdk/Linux_x86_64/24.3/math_libs
 NVMATH_INCLUDES=$(NVMATH_DIR)/include/
 NVMATH_LIBS=$(NVMATH_DIR)/lib64/
-NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O$(FORCE_NVCC_O)
+NVCC_FLAGS = --threads=0 -t=0 -std=c++17 -O$(FORCE_NVCC_O)
 NVCC_LDFLAGS = -L$(NVMATH_LIBS) 
 NVCC_INCLUDES = -I$(NVMATH_INCLUDES)
 NVCC_LDLIBS = -lcublas -lcublasLt

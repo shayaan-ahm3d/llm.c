@@ -1695,6 +1695,7 @@ void inference(GPT2* model,
 			clock_gettime(CLOCK_MONOTONIC, &ttft);
 		}
 		prompt[currentToken+1] = next_token;
+#define PRINT
 #ifdef PRINT
 		// print the generated token, either using the Tokenizer or a fallback
 		if (tokenizer->init_ok) {
