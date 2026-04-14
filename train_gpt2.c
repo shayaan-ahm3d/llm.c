@@ -20,7 +20,7 @@ There will be other versions of this code that specialize it and make it fast.
 #ifdef OMP
 #include <omp.h>
 #endif
-#include <blis/blis.h>
+#include <blis.h>
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 #include "llmc/utils.h"
