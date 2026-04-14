@@ -1725,7 +1725,7 @@ void inference(GPT2* model,
             cpu_logits[i] = (float)cpu_logits_raw[i];
         }
         // write logits to file to compare
-        fwrite(cpu_logits, sizeof(float), model->config.vocab_size, logitsFile);
+        //fwrite(cpu_logits, sizeof(float), model->config.vocab_size, logitsFile);
         // sample the next token
         float coin = random_f32(rng_state);
         int next_token = sample_softmax(cpu_logits, model->config.vocab_size, coin);
