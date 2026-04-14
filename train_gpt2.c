@@ -1240,11 +1240,11 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 }
 
 typedef struct {
-    float cpuLoss;
-    float gpuLoss;
-} Losses;
+    float left;
+    float right;
+} Pair;
 
-Losses compare_implementations(
+Pair compare_implementations(
     FILE* cpu,
     FILE* gpu,
     const int* targets, // from HellaSwag
@@ -1253,7 +1253,8 @@ Losses compare_implementations(
     const int vocabSize,
     const int paddedVocabSize
 ) {
-    const size_t N = batchSize*sequenceLength*paddedVocabSize;
+    (void)paddedVocabSize;
+    const size_t N = batchSize*sequenceLength*vocabSize;
 
     float* cpuLogits = malloc(sizeof(float)*N);
     float* gpuLogits = malloc(sizeof(float)*N);
@@ -1263,22 +1264,35 @@ Losses compare_implementations(
     float* cpuLosses = malloc(sizeof(float)*batchSize*sequenceLength);
     float* gpuLosses = malloc(sizeof(float)*batchSize*sequenceLength);
 
-    fread(cpuLogits, sizeof(float), N, cpu);
-    fread(gpuLogits, sizeof(float), N, gpu);
+    // this only reads from the first sequence
+    const size_t cpuRead = fread(cpuLogits, sizeof(float), N, cpu);
+    const size_t gpuRead = fread(gpuLogits, sizeof(float), N, gpu);
+    if (cpuRead != N || gpuRead != N) {
+        fprintf(stderr, "Error: logits read mismatch (cpu=%zu, gpu=%zu, expected=%zu)\n", cpuRead, gpuRead, N);
+        exit(1);
+    }
 
-    softmax_forward(cpuProbs, cpuLogits, batchSize, sequenceLength, vocabSize, paddedVocabSize, TRAIN_VAL, 0);
-    softmax_forward(gpuProbs, gpuLogits, batchSize, sequenceLength, vocabSize, paddedVocabSize, TRAIN_VAL, 0);
+    softmax_forward(cpuProbs, cpuLogits, batchSize, sequenceLength, vocabSize, vocabSize, TRAIN_VAL, 0);
+    softmax_forward(gpuProbs, gpuLogits, batchSize, sequenceLength, vocabSize, vocabSize, TRAIN_VAL, 0);
 
-    crossentropy_forward(cpuLosses, cpuProbs, targets, batchSize, sequenceLength, paddedVocabSize, TRAIN_VAL, 0);
-    crossentropy_forward(gpuLosses, gpuProbs, targets, batchSize, sequenceLength, paddedVocabSize, TRAIN_VAL, 0);
+    crossentropy_forward(cpuLosses, cpuProbs, targets, batchSize, sequenceLength, vocabSize, TRAIN_VAL, 0);
+    crossentropy_forward(gpuLosses, gpuProbs, targets, batchSize, sequenceLength, vocabSize, TRAIN_VAL, 0);
 
     float cpuLoss = 0.f;
     float gpuLoss = 0.f;
-    for (size_t i = 0; i < N; ++i) {
+    for (size_t i = 0; i < batchSize*sequenceLength; ++i) {
         cpuLoss += cpuLosses[i];
         gpuLoss += gpuLosses[i];
     }
-    return (Losses){.cpuLoss=cpuLoss, .gpuLoss=gpuLoss};
+
+    free(cpuLogits);
+    free(gpuLogits);
+    free(cpuProbs);
+    free(gpuProbs);
+    free(cpuLosses);
+    free(gpuLosses);
+
+    return (Pair){.left = cpuLoss, .right = gpuLoss};
 }
 
 void gpt2_forward(GPT2* model,
@@ -1700,9 +1714,9 @@ void inference(GPT2* model,
 	clock_gettime(CLOCK_MONOTONIC, &end);
 	double timeTakenSeconds = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 	double timeToFirstTokenMillis = 1e3 * ((ttft.tv_sec - start.tv_sec) + (ttft.tv_nsec - start.tv_nsec) / 1e9);
-	write_times(timesFile, sequenceLength, timeTakenSeconds, timeToFirstTokenMillis);
-	if (false) {
-        fwrite(model->acts.logits, sizeof(float), batchSize*sequenceLength*model->config.padded_vocab_size, logitsFile);
+	if (timesFile != NULL) write_times(timesFile, sequenceLength, timeTakenSeconds, timeToFirstTokenMillis);
+	if (logitsFile != NULL) {
+        fwrite(model->acts.logits, sizeof(float), batchSize*(sequenceLength-1)*model->config.vocab_size, logitsFile);
     }
 #define DEBUG
 #ifdef DEBUG
@@ -1800,7 +1814,7 @@ int main(int argc, char* argv[]) {
     int val_loss_every = 20; // every how many steps do we eval validation loss?
     int val_max_steps = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
-    int numInferenceSteps = 64; // number of steps of inference we will do / tokens will be generated
+    int numInferenceSteps = 1024; // number of steps of inference we will do / tokens will be generated
     int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
     int max_steps = 1;
     int override_enable_tf32 = 0;
@@ -1825,6 +1839,7 @@ int main(int argc, char* argv[]) {
     const char* saved_model_file = "gpt2_124M.bin";
     const char* CPU_TIMES = "cpu_times.csv";
     const char* CPU_LOGITS = "cpu_logits.log";
+    const char* GPU_LOGITS = "gpu_logits.log";
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -1870,8 +1885,8 @@ int main(int argc, char* argv[]) {
         else { error_usage(); }
     }
 
-    FILE* timeFile = fopenCheck(CPU_TIMES, "ab");
-    FILE* logitsFile = fopenCheck(CPU_LOGITS, "ab");
+    FILE* timeFile = fopenCheck(CPU_TIMES, "a");
+    FILE* logitsFile = fopenCheck(CPU_LOGITS, "wb");
 
     Logger logger;
     logger_init(&logger, output_log_dir, 0, resume);
@@ -1938,25 +1953,25 @@ int main(int argc, char* argv[]) {
     const bool hellaswag_available = access(hellaswag_path, F_OK) == 0;
     const bool run_hellaswag = hellaswag_eval && hellaswag_available;
     if (run_hellaswag) {
-        const char* GPU_LOGITS = "gpu_logits.log";
         FILE* cpuLogits = fopenCheck(CPU_LOGITS, "rb");
         FILE* gpuLogits = fopenCheck(GPU_LOGITS, "rb");
-        int* correctTokens = (int*)malloc(sizeof(int)*eval_loader.T*eval_loader.B*4);
     	// no multi-GPU so can set index as 0 and total as 1
         evalloader_init(&eval_loader, hellaswag_path, batchSize, maxSequenceLength, 0, 1);
         printf("| run hellaswag         | %-50s |\n", run_hellaswag ? "yes" : "no");
         puts("+-----------------------+----------------------------------------------------+\n");
 	    float eval_acc_norm = 0.0f;
 	    evalloader_reset(&eval_loader);
-
-        const int numberOfCompletions = evalloader_get_correct_completion(correctTokens, &eval_loader);
+		evalloader_next_batch(&eval_loader);
+		int* correctTokens = (int*)malloc(sizeof(int)*eval_loader.T*eval_loader.B*4);
+        const int numberOfCompletions = evalloader_get_answers(correctTokens, &eval_loader, 1);
+        const int compareSequenceLength = sequenceLength - 1;
         for (int sequence = 0; sequence < numberOfCompletions; ++sequence) {
-            int* currentTarget = correctTokens + sequence*sequenceLength;
-            Losses results = compare_implementations(cpuLogits, gpuLogits, currentTarget, 1, sequenceLength, model.config.vocab_size, model.config.padded_vocab_size);
-            printf("CPU: %lf\n", results.cpuLoss);
-            printf("GPU: %lf\n", results.gpuLoss);
+            int* currentTarget = correctTokens + sequence*eval_loader.T;
+            Pair results = compare_implementations(cpuLogits, gpuLogits, currentTarget, 1, compareSequenceLength, model.config.vocab_size, model.config.padded_vocab_size);
+            printf("CPU: %lf\n", results.left);
+            printf("GPU: %lf\n", results.right);
         }
-
+        /*
         printf("Num Batches: %i\n", eval_loader.num_batches);
 	    for (int i = 0; i < eval_loader.num_batches; i++) { // each batch has the 4 possible completion
 #ifdef DEBUG
@@ -1968,10 +1983,11 @@ int main(int argc, char* argv[]) {
 	        int correct = evalloader_stat_losses(&eval_loader, model.acts.losses);
 	        eval_acc_norm += (float)correct;
 	    }
+		*/
 		fcloseCheck(cpuLogits);
         fcloseCheck(gpuLogits);
         free(correctTokens);
-	    printf("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
+	    //printf("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
     }
     // free
     dataloader_free(&train_loader);
