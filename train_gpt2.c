@@ -1716,7 +1716,18 @@ void inference(GPT2* model,
 	double timeToFirstTokenMillis = 1e3 * ((ttft.tv_sec - start.tv_sec) + (ttft.tv_nsec - start.tv_nsec) / 1e9);
 	if (timesFile != NULL) write_times(timesFile, sequenceLength, timeTakenSeconds, timeToFirstTokenMillis);
 	if (logitsFile != NULL) {
-        fwrite(model->acts.logits, sizeof(float), batchSize*(sequenceLength-1)*model->config.vocab_size, logitsFile);
+        const size_t V = model->config.vocab_size;
+        const size_t Vp = model->config.padded_vocab_size;
+        for (int sequence = 0; sequence < batchSize; ++sequence) {
+            for (int token = 0; token < sequenceLength - 1; ++token) {
+                const float* logits_bt = model->acts.logits + sequence*(size_t)sequenceLength*Vp + token*Vp;
+                const size_t wrote = fwrite(logits_bt, sizeof(float), V, logitsFile);
+                if (wrote != V) {
+                    fprintf(stderr, "Error: failed to write logits row\n");
+                    exit(1);
+                }
+            }
+        }
     }
 #define DEBUG
 #ifdef DEBUG
