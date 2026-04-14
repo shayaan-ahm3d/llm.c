@@ -1708,7 +1708,7 @@ void inference(GPT2* model,
 #ifndef ENABLE_CUDNN
         if (batchSize == 1) {
             // Decode exactly one position and reuse cached K/V from previous steps
-            gpt2_forward_kvcache(model, prompt, 1, sequenceLength, token - 1);
+            gpt2_forward_kvcache(model, prompt, batchSize, sequenceLength, token - 1);
         } else
 #endif
         {
@@ -2059,10 +2059,8 @@ int main(int argc, char *argv[]) {
     for (; step <= train_num_batches; step++) {
         NvtxRange step_range("Train step", step);
 
-        int last_step = step == train_num_batches;
-
         // once in a while estimate the validation loss (all processes collaborate)
-        if (step % val_loss_every == 0 || last_step) {
+        if (false) {
             NvtxRange validation_range("validation");
             float val_loss = 0.0f;
             dataloader_reset(&val_loader);
@@ -2077,8 +2075,7 @@ int main(int argc, char *argv[]) {
         }
 
         // once in a while estimate HellaSwag accuracy (all processes collaborate)
-        if (run_hellaswag &&
-           ((step > 0 && step % val_loss_every == 0) || last_step)) {
+        if (run_hellaswag) {
             NvtxRange evaluation_range("evaluation");
             float eval_acc_norm = 0.0f;
             evalloader_reset(&eval_loader);
@@ -2096,8 +2093,7 @@ int main(int argc, char *argv[]) {
         }
 
         // once in a while do model inference to print generated text (only rank 0)
-        if (multi_gpu_config.process_rank == 0 && sample_every > 0 &&
-           (step > 0 && (step % sample_every) == 0 || last_step)) {
+        if (true) {
             NvtxRange generation_range("generation");
             // fill up gen_tokens with the <|endoftext|> token, which kicks off the generation
             int eot_token = tokenizer.eot_token;
@@ -2110,8 +2106,7 @@ int main(int argc, char *argv[]) {
         }
 
         // once in a while checkpoint the optimization state (all ranks)
-        if ((checkpoint_every > 0 && output_log_dir != NULL && resuming == 0) &&
-            ((step > 0 && step % checkpoint_every == 0) || last_step)) {
+        if (false) {
             // writes model .bin file, state .bin files, and DONE file for step
             write_checkpoint(output_log_dir, step, &model, &train_loader, &multi_gpu_config);
             // we only keep checkpoints_keep checkpoints on disk to save space
@@ -2130,7 +2125,6 @@ int main(int argc, char *argv[]) {
         // but also after the very last iteration. so we loop for step <= train_num_batches
         // instead of just < train_num_batches (one extra due to <=), only to do
         // the validation/sampling one last time, and then we break right here as we're done.
-        if (last_step) { break; }
 
         // --------------- TRAINING SECTION BEGIN -----------------
         if (overfit_single_batch == 1) {
