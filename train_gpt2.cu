@@ -2048,7 +2048,7 @@ int main(int argc, char *argv[]) {
     const char* GPU_TIMES = "gpu_times.csv";
     const char* GPU_LOGITS = "gpu_logits.log";
     FILE* timeFile = fopenCheck(GPU_TIMES, "a");
-    FILE* logitsFile = fopenCheck(GPU_LOGITS, "a");
+    FILE* logitsFile = fopenCheck(GPU_LOGITS, "ab");
     uint64_t sample_rng_state = 1337;
     cudaEvent_t start, end;
     cudaCheck(cudaEventCreate(&start));
