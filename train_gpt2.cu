@@ -6,7 +6,6 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string>
-#include <string_view>
 #include <sys/stat.h>
 #include <sys/types.h>
 // ----------- CPU utilities -----------
@@ -253,11 +252,52 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[20] = TENSOR_SPEC(data->scratch_btc, B * T * C);
 }
 
-void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]) {
+typedef struct {
+    GPT2Config config;
+    // the weights of the model, and their sizes
+    ParameterTensors params;
+    size_t param_elements[NUM_PARAMETER_TENSORS];
+    size_t param_sizeof[NUM_PARAMETER_TENSORS];
+    void* params_memory;
+    size_t num_parameters;
+    size_t num_parameters_bytes;
+    // gradients of the weights
+    ParameterTensors grads;
+    void* grads_memory;
+    // buffers for the AdamW optimizer
+    float* m_memory;
+    float* v_memory;
+    float* master_weights;     // is NULL unless fp32 weights is enabled.
+    // the activations of the model, and their sizes
+    ActivationTensors acts;
+    TensorSpec acts_specs[NUM_ACTIVATION_TENSORS];
+    void* acts_memory;
+    int acts_memory_bytes;
+    // other run state configuration
+    int batch_size; // the batch size (B) of current forward pass
+    int seq_len; // the sequence length (T) of current forward pass
+    int* inputs; // the input tokens for the current forward pass
+    int* targets; // the target tokens for the current forward pass
+    float mean_loss; // after the last backward micro-batch, will be populated with mean loss across all GPUs and micro-steps
+    float* accumulated_mean_loss; // GPU buffer used to accumulate loss across micro-steps
+    float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
+    uint64_t rng_state; // the RNG state for seeding stochastic rounding etc.
+    uint64_t rng_state_last_update; // RNG before last gpt2_update() to re-round identically from master weights
+    int use_master_weights; // keep master weights copy in float for optim update? 0|1
+    bool init_state;   // set to true if master weights need to be initialized
+    int gelu_fusion; // fuse gelu via cuBLASLt (0=none, 1=forward, 2=forward+backward)
+    int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
+    // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
+    int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
+    int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
+} GPT2;
+
+void* malloc_and_point_activations(GPT2* model, TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]) {
     size_t bytes = 0;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
         bytes += tensors[i].size * sizeof_dtype(tensors[i].type);
     }
+    model->acts_memory_bytes = bytes;
 
     printf0("allocating %d MiB for activations\n", (int)round(bytes / (1024 * 1024)));
 
@@ -281,45 +321,6 @@ void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]
     }
     return acts_memory;
 }
-
-typedef struct {
-    GPT2Config config;
-    // the weights of the model, and their sizes
-    ParameterTensors params;
-    size_t param_elements[NUM_PARAMETER_TENSORS];
-    size_t param_sizeof[NUM_PARAMETER_TENSORS];
-    void* params_memory;
-    size_t num_parameters;
-    size_t num_parameters_bytes;
-    // gradients of the weights
-    ParameterTensors grads;
-    void* grads_memory;
-    // buffers for the AdamW optimizer
-    float* m_memory;
-    float* v_memory;
-    float* master_weights;     // is NULL unless fp32 weights is enabled.
-    // the activations of the model, and their sizes
-    ActivationTensors acts;
-    TensorSpec acts_specs[NUM_ACTIVATION_TENSORS];
-    void* acts_memory;
-    // other run state configuration
-    int batch_size; // the batch size (B) of current forward pass
-    int seq_len; // the sequence length (T) of current forward pass
-    int* inputs; // the input tokens for the current forward pass
-    int* targets; // the target tokens for the current forward pass
-    float mean_loss; // after the last backward micro-batch, will be populated with mean loss across all GPUs and micro-steps
-    float* accumulated_mean_loss; // GPU buffer used to accumulate loss across micro-steps
-    float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
-    uint64_t rng_state; // the RNG state for seeding stochastic rounding etc.
-    uint64_t rng_state_last_update; // RNG before last gpt2_update() to re-round identically from master weights
-    int use_master_weights; // keep master weights copy in float for optim update? 0|1
-    bool init_state;   // set to true if master weights need to be initialized
-    int gelu_fusion; // fuse gelu via cuBLASLt (0=none, 1=forward, 2=forward+backward)
-    int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
-    // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
-    int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
-    int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
-} GPT2;
 
 void gpt2_init_common(GPT2 *model) {
     // common inits outside of the model weights
@@ -375,7 +376,7 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
 
     // allocate the space
     fill_in_activation_sizes(&model->acts, model->acts_specs, B, T, model->config, model->recompute);
-    model->acts_memory = malloc_and_point_activations(model->acts_specs);
+    model->acts_memory = malloc_and_point_activations(model, model->acts_specs);
     // also create memory for caching inputs and targets
     cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
     cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
@@ -769,9 +770,9 @@ __global__ void encoder_forward_cached_kernel(
     // weightPositionalEmbeddings is (maxT,C) of position embeddings
     // currentToken should be the current token for inference
     // can process all tokens in parallel
-    
+
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < dimensions) { 
+    if (i < dimensions) {
 	    // seek to the position in wte corresponding to the token
 	    floatX* outputPosition = output + 0*sequenceLength*dimensions + currentToken*dimensions;
 	    // get the index of the token at inp[b, t]
@@ -782,7 +783,7 @@ __global__ void encoder_forward_cached_kernel(
         const floatX* wpe_t = weightPositionalEmbeddings + currentToken*dimensions;
         // add the two vectors and store the result in out[b,t,:]
         outputPosition[i] = wte_ix[i] + wpe_t[i];
-    }    
+    }
 }
 
 __global__ void qkv_cache_split(
@@ -1728,10 +1729,10 @@ void inference(GPT2* model,
         // sample the next token
         float coin = random_f32(rng_state);
         int next_token = sample_softmax(cpu_logits, model->config.vocab_size, coin);
-        if (token == 1) clock_gettime(CLOCK_MONOTONIC, &ttft); 
+        if (token == 1) clock_gettime(CLOCK_MONOTONIC, &ttft);
         prompt[token] = next_token;
 #define PRINT
-#ifdef PRINT 
+#ifdef PRINT
         // print the generated token, either using the Tokenizer or a fallback
         if (tokenizer->init_ok) {
             const char* token_str = tokenizer_decode(tokenizer, next_token);
@@ -2104,7 +2105,7 @@ int main(int argc, char *argv[]) {
                 prompt[i] = eot_token;
             }
             // now sample from the model autoregressively
-		    memset(model.acts_memory, 0, NUM_ACTIVATION_TENSORS*sizeof(floatX));
+            cudaCheck(cudaMemset(model.acts_memory, 0, model.acts_memory_bytes));
             inference(&model, &tokenizer, prompt, batchSize, sequenceLength, &sample_rng_state, cpu_logits_raw, cpu_logits, timeFile, logitsFile);
         }
 
