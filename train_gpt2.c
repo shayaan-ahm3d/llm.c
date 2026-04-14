@@ -107,7 +107,7 @@ void encoder_forward(
 	                // seek to the position in wpe corresponding to the position
 	                const float* wpe_t = weightPositionalEmbeddings + token*dimensions;
 	                // add the two vectors and store the result in out[b,t,:]
-	                #pragma omp simd
+
 	                for (int i = 0; i < dimensions; i++) {
 	                    outputPosition[i] = wte_ix[i] + wpe_t[i];
 	                }
@@ -127,7 +127,7 @@ void encoder_forward(
                 // seek to the position in wpe corresponding to the position
                 const float* wpe_t = weightPositionalEmbeddings + currentToken*dimensions;
                 // add the two vectors and store the result in out[b,t,:]
-                #pragma omp simd
+
                 for (int i = 0; i < dimensions; i++) {
                     outputPosition[i] = wte_ix[i] + wpe_t[i];
                 }
@@ -184,14 +184,14 @@ void layernorm_forward(
 	                const float* x = input + sequence*sequenceLength*dimensions + token*dimensions;
 	                // calculate the mean
 	                float m = 0.0f;
-	                #pragma omp simd
+
 	                for (int i = 0; i < dimensions; i++) {
 	                    m += x[i];
 	                }
 	                m /= dimensions;
 	                // calculate the variance (without any bias correction)
 	                float v = 0.0f;
-	                #pragma omp simd
+
 	                for (int i = 0; i < dimensions; i++) {
 	                    const float xshift = x[i] - m;
 	                    v += xshift * xshift;
@@ -201,7 +201,7 @@ void layernorm_forward(
 	                const float s = 1.0f / sqrtf(v + eps);
 	                // seek to the output position in out[b,t,:]
 	                float* out_bt = output + sequence*sequenceLength*dimensions + token*dimensions;
-	                #pragma omp simd
+
 	                for (int i = 0; i < dimensions; i++) {
 	                    const float n = (s * (x[i] - m)); // normalize
 	                    const float o = n * weight[i] + bias[i]; // scale and shift
@@ -221,14 +221,14 @@ void layernorm_forward(
 		        const float* x = input + sequence*sequenceLength*dimensions + currentToken*dimensions;
 		        // calculate the mean
 		        float m = 0.0f;
-		        #pragma omp simd
+
 		        for (int i = 0; i < dimensions; i++) {
 		            m += x[i];
 		        }
 		        m /= dimensions;
 		        // calculate the variance (without any bias correction)
 		        float v = 0.0f;
-		        #pragma omp simd
+
 		        for (int i = 0; i < dimensions; i++) {
 		            const float xshift = x[i] - m;
 		            v += xshift * xshift;
@@ -238,7 +238,7 @@ void layernorm_forward(
 		        const float s = 1.0f / sqrtf(v + eps);
 		        // seek to the output position in out[b,t,:]
 		        float* out_bt = output + sequence*sequenceLength*dimensions + currentToken*dimensions;
-		        #pragma omp simd
+
 		        for (int i = 0; i < dimensions; i++) {
 		            const float n = (s * (x[i] - m)); // normalize
 		            const float o = n * weight[i] + bias[i]; // scale and shift
@@ -459,7 +459,6 @@ void matmul_backward(
         for (int t = 0; t < T; t++) {
             const float* dout_bt = dout + b * T * OC + t * OC;
             float* dinp_bt = dinp + b * T * C + t * C;
-            #pragma omp simd collapse(2)
             for (int o = 0; o < OC; o++) {
                 for (int i = 0; i < C; i++) {
                 	float* wrow = weight + o*C;
@@ -564,7 +563,7 @@ void attention_forward(
 	                    // pass 1: calculate query dot key and maxval
 	                    float maxval = -10000.0f; // TODO something better
 	                    // this loop iterates over all previous elements in K
-                        #pragma omp simd
+
 	                    for (int t2 = 0; t2 <= token; t2++) {
 	                    	// query is t but key is t2 as key requires full history of previous tokens, whereas query just requires current
 	                        const float* key_t2 = qkv + sequence*sequenceLength*C3 + t2*C3 + head*headSize + dimensions; // +dimensions because it's key
@@ -585,7 +584,7 @@ void attention_forward(
 	                    // pass 2: calculate the exp and keep track of sum
 	                    // maxval is being calculated and subtracted only for numerical stability
 	                    float expsum = 0.0f;
-                        #pragma omp simd
+
 	                    for (int t2 = 0; t2 <= token; t2++) {
 	                        float expv = expf(preatt_bth[t2] - maxval);
 	                        expsum += expv;
@@ -594,7 +593,7 @@ void attention_forward(
 	                    float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
 
 	                    // pass 3: normalize to get the softmax
-                        #pragma omp simd
+
 	                    for (int t2 = 0; t2 <= sequenceLength - 1; t2++) {
 	                        if (t2 <= token) {
 	                            att_bth[t2] *= expsum_inv;
@@ -607,11 +606,10 @@ void attention_forward(
 
 	                    // pass 4: accumulate weighted values into the output of attention
 	                    float* out_bth = out + sequence*sequenceLength*dimensions + token*dimensions + head*headSize;
-	                    #pragma omp simd
+
                         for (int i = 0; i < headSize; i++) {
 	                    	out_bth[i] = 0.0f;
 	                    }
-                        #pragma omp simd collapse(2)
 	                    for (int t2 = 0; t2 <= token; t2++) {
 	                        for (int i = 0; i < headSize; i++) {
 	                            const float att_btht2 = att_bth[t2];
@@ -635,7 +633,7 @@ void attention_forward(
                     // pass 1: calculate query dot key and maxval
                     float maxval = -10000.0f; // TODO something better
                     // this loop iterates over all previous elements in K
-                    #pragma omp simd
+
                     for (int t2 = 0; t2 <= currentToken; t2++) {
                     	// query is t but key is t2 as key requires full history of previous tokens, whereas query just requires current
                         const float* key_t2 = qkv + sequence*sequenceLength*C3 + t2*C3 + head*headSize + dimensions; // +dimensions because it's key
@@ -656,7 +654,7 @@ void attention_forward(
                     // pass 2: calculate the exp and keep track of sum
                     // maxval is being calculated and subtracted only for numerical stability
                     float expsum = 0.0f;
-                    #pragma omp simd
+
                     for (int t2 = 0; t2 <= currentToken; t2++) {
                         float expv = expf(preatt_bth[t2] - maxval);
                         expsum += expv;
@@ -665,7 +663,7 @@ void attention_forward(
                     float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
 
                     // pass 3: normalize to get the softmax
-                    #pragma omp simd
+
                     for (int t2 = 0; t2 <= currentToken; t2++) {
                         if (t2 <= currentToken) {
                             att_bth[t2] *= expsum_inv;
@@ -678,11 +676,10 @@ void attention_forward(
 
                     // pass 4: accumulate weighted values into the output of attention
                     float* out_bth = out + sequence*sequenceLength*dimensions + currentToken*dimensions + head*headSize;
-                    #pragma omp simd
+
                     for (int i = 0; i < headSize; i++) {
                     	out_bth[i] = 0.0f;
                     }
-                    #pragma omp simd collapse(2)
                     for (int t2 = 0; t2 <= currentToken; t2++) {
                         for (int i = 0; i < headSize; i++) {
                             const float* value_t2 = qkv + sequence*sequenceLength*C3 + t2*C3 + head*headSize + dimensions*2; // +dimensions*2 because it's value
@@ -773,7 +770,7 @@ void gelu_forward(
 	// (approximate) GeLU elementwise non-linearity in the MLP block of Transformer
 	switch (mode) {
 		case TRAIN_VAL: {
-			#pragma omp simd
+
     		for (int i = 0; i < batchSize*sequenceLength*dimensions; i++) {
         		const float x = inp[i];
           		const float cube = 0.044715f * x * x * x;
@@ -782,7 +779,6 @@ void gelu_forward(
 			break;
 		}
 		case INFERENCE: {
-			#pragma omp simd collapse(2)
     		for (int sequence = 0; sequence < batchSize; sequence++) {
       			for (int dim = 0; dim < dimensions; dim++) {
          			const int index = sequence*sequenceLength*dimensions + currentToken*dimensions + dim;
@@ -828,14 +824,13 @@ void residual_forward(
 ) {
 	switch (mode) {
 		case TRAIN_VAL: {
-			#pragma omp simd
+
     		for (int i = 0; i < batchSize*sequenceLength*dimensions; i++) {
         		out[i] = inp1[i] + inp2[i];
       		}
 			break;
 		}
 		case INFERENCE: {
-			#pragma omp simd collapse(2)
 			for (int sequence = 0; sequence < batchSize; ++sequence) {
 				for (int dim = 0; dim < dimensions; ++dim) {
 					const int index = sequence*sequenceLength*dimensions + currentToken*dimensions + dim;
@@ -880,26 +875,26 @@ void softmax_forward(
 
 	                // maxval is only calculated and subtracted for numerical stability
 	                float maxval = -10000.0f; // TODO something better
-	                #pragma omp simd
+
 	                for (int i = 0; i < vocabSize; i++) {
 	                    if (logits_bt[i] > maxval) {
 	                        maxval = logits_bt[i];
 	                    }
 	                }
 	                float sum = 0.0f;
-	                #pragma omp simd
+
 	                for (int i = 0; i < vocabSize; i++) {
 	                    probs_bt[i] = expf(logits_bt[i] - maxval);
 	                    sum += probs_bt[i];
 	                }
 	                // note we only loop to V, leaving the padded dimensions
-	                #pragma omp simd
+
 	                for (int i = 0; i < vocabSize; i++) {
 	                    probs_bt[i] /= sum;
 	                }
 	                // for extra super safety we may wish to include this too,
 	                // forcing the probabilities here to be zero, but it shouldn't matter
-	                #pragma omp simd
+
 	                for (int i = vocabSize; i < paddedVocabSize; i++) {
 	                    probs_bt[i] = 0.0f;
 	                }
@@ -916,26 +911,26 @@ void softmax_forward(
 
                 // maxval is only calculated and subtracted for numerical stability
                 float maxval = -10000.0f; // TODO something better
-                #pragma omp simd
+
                 for (int i = 0; i < vocabSize; i++) {
                     if (logits_bt[i] > maxval) {
                         maxval = logits_bt[i];
                     }
                 }
                 float sum = 0.0f;
-                #pragma omp simd
+
                 for (int i = 0; i < vocabSize; i++) {
                     probs_bt[i] = expf(logits_bt[i] - maxval);
                     sum += probs_bt[i];
                 }
                 // note we only loop to V, leaving the padded dimensions
-                #pragma omp simd
+
                 for (int i = 0; i < vocabSize; i++) {
                     probs_bt[i] /= sum;
                 }
                 // for extra super safety we may wish to include this too,
                 // forcing the probabilities here to be zero, but it shouldn't matter
-                #pragma omp simd
+
                 for (int i = vocabSize; i < paddedVocabSize; i++) {
                     probs_bt[i] = 0.0f;
                 }
@@ -962,7 +957,7 @@ void crossentropy_forward(
     for (int sequence = 0; sequence < batchSize; sequence++) {
     	switch (mode) {
      		case TRAIN_VAL: {
-       			#pragma omp simd
+
        			for (int token = 0; token < sequenceLength; token++) {
 	            	// loss = -log(probs[target])
 		            const float* probs_bt = probs + sequence*sequenceLength*paddedVocabSize + token*paddedVocabSize;
@@ -1451,7 +1446,6 @@ void gpt2_forward(GPT2* model,
         float mean_loss = 0.0f;
         switch (mode) {
         	case TRAIN_VAL: {
-         		#pragma omp simd
          		for (int i = 0; i < batchSize*sequenceLength; i++) {
                 	mean_loss += model->acts.losses[i];
                 }
