@@ -502,7 +502,6 @@ void cached_matmul_forward(
 ) {
 	assert(mode == INFERENCE);
     assert(dimensions == outputDimensions);
-    #pragma omp parallel for
     for (int sequence = 0; sequence < batchSize; ++sequence) {
     	// use 3*dimensions so it goes over the QKV to get to the next token, otherwise would index into wrong thing
     	// fill that cache line with the bias values already
