@@ -1967,7 +1967,7 @@ int main(int argc, char* argv[]) {
         FILE* cpuLogits = fopenCheck(CPU_LOGITS, "rb");
         FILE* gpuLogits = fopenCheck(GPU_LOGITS, "rb");
     	// no multi-GPU so can set index as 0 and total as 1
-        evalloader_init(&eval_loader, hellaswag_path, batchSize, maxSequenceLength, 0, 1);
+        evalloader_init(&eval_loader, hellaswag_path, 4, maxSequenceLength, 0, 1);
         printf("| run hellaswag         | %-50s |\n", run_hellaswag ? "yes" : "no");
         puts("+-----------------------+----------------------------------------------------+\n");
 	    float eval_acc_norm = 0.0f;
