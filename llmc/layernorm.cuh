@@ -195,9 +195,9 @@ __global__ void layernorm_forward_inference_kernel(float* __restrict__ output,
     }
 }
 
-__global__ void fused_residual_forward_kernel5(float* residual, float* normed, float* mean, float* rstd,
-                                               const float* inp1, const float* inp2,
-                                               const float* weight, const float* bias,
+__global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed, float* mean, float* rstd,
+                                               const floatX* inp1, const floatX* inp2,
+                                               const floatX* weight, const floatX* bias,
                                                int N, int C) {
     assert(blockDim.x == WARP_SIZE);
 
@@ -486,12 +486,12 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
 // kernel launchers
 
 // similar to `fused_residual_forward5`
-void layernorm_forward(float* output,
+void layernorm_forward(floatX* output,
     float* mean,
     float* rstd,
-    const float* input,
-    const float* weight,
-    const float* bias,
+    const floatX* input,
+    const floatX* weight,
+    const floatX* bias,
     const int batchSize,
     const int contextLength,
     const int maxSequenceLength,
@@ -521,9 +521,9 @@ void layernorm_forward(float* output,
     cudaCheck(cudaGetLastError());
 }
 
-void residual_forward(float* out,
-    const float* inp1,
-    const float* inp2,
+void residual_forward(floatX* out,
+    const floatX* inp1,
+    const floatX* inp2,
     const int batchSize,
     const int contextLength,
     const int maxSequenceLength,
@@ -542,14 +542,14 @@ void residual_forward(float* out,
 }
 
 void fused_residual_forward5(
-    float* residual,
-    float* normed,
+    floatX* residual,
+    floatX* normed,
     float* mean,
     float* rstd,
-    const float* inp1,
-    const float* inp2,
-    const float* weight,
-    const float* bias,
+    const floatX* inp1,
+    const floatX* inp2,
+    const floatX* weight,
+    const floatX* bias,
     const int batchSize,
     const int contextLength,
     const int maxSequenceLength,

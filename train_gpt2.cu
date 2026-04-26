@@ -1,6 +1,7 @@
 /*
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
+#include <type_traits>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +9,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <cuda/cmath>
 // ----------- CPU utilities -----------
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 // defines: create_dir_if_not_exists, find_max_step, ends_with_bin
@@ -246,7 +248,7 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[15] = TENSOR_SPEC(data->lnf_rstd, B * T);
     tensors[16] = TENSOR_SPEC(data->losses, B * T);
     tensors[17] = TENSOR_SPEC(data->qkvr, L * B * T * 3*C);
-    tensors[18] = TENSOR_SPEC(data->output, B * T * max(3*C, max(NH*T, Vp)));
+    tensors[18] = TENSOR_SPEC(data->output, B * T * std::max(3*C, std::max(NH*T, Vp)));
 
     tensors[19] = TENSOR_SPEC(data->scratch_bt4c, B * T * 4 * C);
     tensors[20] = TENSOR_SPEC(data->scratch_btc, B * T * C);
@@ -681,7 +683,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
 
     // first layernorm isn't fused
-    layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
+    layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, T, C, TRAIN_VAL, main_stream);
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
@@ -732,7 +734,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         #endif
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
-        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
+        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B, T, T, C, TRAIN_VAL, 0, main_stream);
         matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
         matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
         // OK, fusion across blocks.
@@ -743,11 +745,11 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
             const floatX* l_ln1b = params.ln1b + (l + 1) * C;
             fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, scratch, l_ln1w, l_ln1b,
-                                    B * T, C, main_stream);
+                                    B, T, T, C, TRAIN_VAL, 0, main_stream);
         } else {
             fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, scratch,
                                     params.lnfw, params.lnfb,
-                                    B * T, C, main_stream);
+                                    B, T, T, C, TRAIN_VAL, 0, main_stream);
         }
     }
 
@@ -755,12 +757,167 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     cudaCheck(cudaDeviceSynchronize());
 }
 
-__global__ void encoder_forward_cached_kernel(
+// propagate inputs through the network to produce logits.
+// right now, this function is fully synchronous with the host
+void gpt2_forward_prefill(GPT2* model,
+    const int* inputs,
+    const size_t batchSize,
+    const size_t contextLength,
+    const size_t maxSequenceLength
+) {
+    NVTX_RANGE_FN();
+    // we must be careful and use size_t instead of int, otherwise
+    // we could overflow int. E.g. l * B * NH * T * T overflows int at B 16.
+
+    // ensure the model was initialized or error out
+    if (model->params_memory == NULL) {
+        printf("Error: model was not initialized properly.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // convenience parameters
+    const size_t vocabSize = model->config.vocab_size;
+    const size_t paddedVocabSize = model->config.padded_vocab_size;
+    const size_t numLayers = model->config.num_layers;
+    const size_t numHeads = model->config.num_heads;
+    const size_t dimensions = model->config.channels;
+
+    // validate B,T are not larger than the values used at initialisation
+    // (smaller B,T are okay for inference only)
+    if (batchSize > model->batch_size || maxSequenceLength > model->seq_len) {
+        printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, (int)batchSize, (int)maxSequenceLength);
+        exit(EXIT_FAILURE);
+    }
+
+    // copy inputs/targets to the model
+    cudaCheck(cudaMemcpy(model->inputs, inputs, batchSize * contextLength * sizeof(int), cudaMemcpyHostToDevice));
+    // validate inputs, all indices must be in the range [0, V)
+    // we can do this while the copies are already underway
+    tokenCheck(inputs, batchSize*contextLength, vocabSize);
+
+    // forward pass
+    ParameterTensors params = model->params; // for brevity
+    ActivationTensors acts = model->acts;
+    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, batchSize, maxSequenceLength, dimensions, main_stream); // encoding goes into residual[0]
+
+    // first layernorm isn't fused
+    layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, batchSize, contextLength, maxSequenceLength, dimensions, PREFILL, main_stream);
+
+    for (int l = 0; l < numLayers; l++) {
+        NvtxRange layer_range("Layer", l);
+
+        floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * batchSize * maxSequenceLength * dimensions;
+
+        // get the pointers of the weights for this layer
+        floatX* l_qkvw = params.qkvw + l * 3*dimensions * dimensions;
+        floatX* l_qkvb = params.qkvb + l * 3*dimensions;
+        floatX* l_attprojw = params.attprojw + l * dimensions * dimensions;
+        floatX* l_attprojb = params.attprojb + l * dimensions;
+        floatX* l_ln2w = params.ln2w + l * dimensions;
+        floatX* l_ln2b = params.ln2b + l * dimensions;
+        floatX* l_fcw = params.fcw + l * 4*dimensions * dimensions;
+        floatX* l_fcb = params.fcb + l * 4*dimensions;
+        floatX* l_fcprojw = params.fcprojw + l * dimensions * 4*dimensions;
+        floatX* l_fcprojb = params.fcprojb + l * dimensions;
+
+        // get the pointers of the activations for this layer
+        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * batchSize * maxSequenceLength * dimensions : acts.lnf;
+        floatX* l_qkvr = acts.qkvr + l * batchSize * maxSequenceLength * 3*dimensions;
+        floatX* l_atty = acts.atty + l * batchSize * maxSequenceLength * dimensions;
+        floatX* l_residual2 = acts.residual2 + l * batchSize * maxSequenceLength * dimensions;
+        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * batchSize * maxSequenceLength * dimensions : acts.lnf;
+        float* l_ln2_mean = acts.ln2_mean + l * batchSize * maxSequenceLength;
+        float* l_ln2_rstd = acts.ln2_rstd + l * batchSize * maxSequenceLength;
+        floatX* l_fch = acts.fch + l * batchSize * maxSequenceLength * 4*dimensions;
+        // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
+        // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
+        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * batchSize * maxSequenceLength * 4*dimensions : acts.fch_gelu;
+        floatX* l_residual3 = acts.residual3 + l * batchSize * maxSequenceLength * dimensions;
+        floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
+
+        // now do the forward pass
+        #ifdef ENABLE_CUDNN
+        float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
+        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
+        #else
+        floatX* l_att = acts.att + l * batchSize * numHeads * maxSequenceLength * maxSequenceLength;
+        if (maxSequenceLength != model->seq_len) { // unused parts of attention buffer must be zeroed (T-dependent)
+            cudaCheck(cudaMemset(l_att, 0, batchSize * numHeads * maxSequenceLength * maxSequenceLength * sizeof(float)));
+        }
+        // these are only needed as scratchpads for the forward pass, but
+        // need not be stored for backward
+        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, batchSize, maxSequenceLength, dimensions, 3*dimensions, main_stream);
+        attention_forward(l_atty, l_qkvr, l_att, scratch, batchSize, maxSequenceLength, dimensions, numHeads, main_stream);
+        #endif
+
+        matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, batchSize, maxSequenceLength, dimensions, dimensions, main_stream);
+        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, batchSize, contextLength, maxSequenceLength, dimensions, PREFILL, 0, main_stream);
+        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, batchSize, maxSequenceLength, dimensions, 4*dimensions, main_stream, l_fch, model->gelu_fusion);
+        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, batchSize, maxSequenceLength, 4*dimensions, dimensions, main_stream);
+        // OK, fusion across blocks.
+        if(l+1 != numLayers) {
+            floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * batchSize * maxSequenceLength * dimensions : acts.lnf;
+            float* l_ln1_mean = acts.ln1_mean + (l + 1) * batchSize * maxSequenceLength;
+            float* l_ln1_rstd = acts.ln1_rstd + (l + 1) * batchSize * maxSequenceLength;
+            const floatX* l_ln1w = params.ln1w + (l + 1) * dimensions;
+            const floatX* l_ln1b = params.ln1b + (l + 1) * dimensions;
+            fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, scratch, l_ln1w, l_ln1b,
+                                    batchSize, contextLength, maxSequenceLength, dimensions, PREFILL, 0, main_stream);
+        } else {
+            fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, scratch,
+                                    params.lnfw, params.lnfb,
+                                    batchSize, contextLength, maxSequenceLength, dimensions, PREFILL, 0, main_stream);
+        }
+    }
+
+    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, batchSize, maxSequenceLength, dimensions, paddedVocabSize, main_stream);
+    cudaCheck(cudaDeviceSynchronize());
+}
+
+ // Use for prefill stage of inference
+__global__ void encoder_forward_prefill_kernel(
+    float* output,
+    const int* tokenIdsAtPosition,
+    const float* weightTokenEmbeddings,
+    const float* weightPositionalEmbeddings,
+    const size_t contextLength,
+    const size_t maxSequenceLength,
+    const size_t dimensions
+) {
+    // output is (B,T,C). At each position (b,t), a C-dimensional vector summarizing token & position
+    // tokenIdsAtPosition is (B,T) of integers, holding the token ids at each (b,t) position
+    // weightTokenEmbeddings is (V,C) of token embeddings
+    // weightPositionalEmbeddings is (maxT,C) of position embeddings
+    // currentToken should be the current token for inference
+    // can process all tokens in parallel
+
+    const int location = blockIdx.x*blockDim.x + threadIdx.x;
+    // flatten over maxSequenceLength and dimensions
+    if (location < contextLength*dimensions) {
+        // which token is this kernel processing
+        const int currentToken = location / dimensions;
+        const int dim = location % dimensions;
+	    // seek to the position in wte corresponding to the token
+	    float* outputPosition = output + 0*maxSequenceLength*dimensions + currentToken*dimensions;
+	    // get the index of the token at inp[b, t]
+        const int tokenIndex = tokenIdsAtPosition[currentToken];
+	    // seek to the position in wte corresponding to the token
+        const float* wte_ix = weightTokenEmbeddings + tokenIndex*dimensions;
+        // seek to the position in wpe corresponding to the position
+        const float* wpe_t = weightPositionalEmbeddings + currentToken*dimensions;
+        // add the two vectors and store the result in out[b,t,:]
+        outputPosition[dim] = wte_ix[dim] + wpe_t[dim];
+    }
+}
+
+// Use for decode stage of inference
+__global__ void encoder_forward_inference_kernel(
     floatX* output,
     const int* tokenIdsAtPosition,
     const floatX* weightTokenEmbeddings,
     const floatX* weightPositionalEmbeddings,
-    const size_t sequenceLength,
+    const size_t maxSequenceLength,
     const size_t dimensions,
     const size_t currentToken
 ) {
@@ -774,7 +931,8 @@ __global__ void encoder_forward_cached_kernel(
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < dimensions) {
 	    // seek to the position in wte corresponding to the token
-	    floatX* outputPosition = output + 0*sequenceLength*dimensions + currentToken*dimensions;
+					// // 0 as not concerned with batches (yet)
+	    floatX* outputPosition = output + 0*maxSequenceLength*dimensions + currentToken*dimensions;
 	    // get the index of the token at inp[b, t]
         const int tokenIndex = tokenIdsAtPosition[currentToken];
 	    // seek to the position in wte corresponding to the token
@@ -786,6 +944,8 @@ __global__ void encoder_forward_cached_kernel(
     }
 }
 
+// Helper function to split up QKV so easier to deal with
+// Could make device function?
 __global__ void qkv_cache_split(
     floatX* query,
     floatX* key,
@@ -810,7 +970,7 @@ __global__ void qkv_cache_split(
     value[indexInCache] = qkv_token[2*dimensions + i];
 }
 
-__global__ void attention_forward_token_kernel(
+__global__ void attention_forward_inference_kernel(
     floatX* output,
     floatX* attention,
     const floatX* query,
@@ -822,7 +982,7 @@ __global__ void attention_forward_token_kernel(
     const int headSize,
     const int currentToken
 ) {
-    // One block handles one attention head for B=1 decode.
+    // 1 block handles 1 attention head for batchSize=1 decode
     const int head = blockIdx.x;
     if (head >= numHeads) { return; }
 
@@ -846,13 +1006,13 @@ __global__ void attention_forward_token_kernel(
             maxval = fmaxf(maxval, score);
         }
 
-        floatX expsum = 0.0f;
+        float expsum = 0.0f;
         for (int t2 = 0; t2 <= currentToken; t2++) {
-            floatX p = expf(probs[t2] - maxval);
+            float p = expf(probs[t2] - maxval);
             probs[t2] = p;
             expsum += p;
         }
-        floatX inv_expsum = expsum == (floatX)0.0 ? (floatX)0.0 : (floatX)1.0 / expsum;
+        float inv_expsum = expsum == (float)0.0 ? (float)0.0 : (float)1.0 / expsum;
         for (int t2 = 0; t2 <= currentToken; t2++) {
             probs[t2] *= inv_expsum;
         }
@@ -860,10 +1020,10 @@ __global__ void attention_forward_token_kernel(
         if (attention != nullptr) {
             floatX* att_row = attention + head*sequenceLength*sequenceLength + currentToken*sequenceLength;
             for (int t2 = 0; t2 <= currentToken; t2++) {
-                att_row[t2] = (floatX)probs[t2];
+                att_row[t2] = (float)probs[t2];
             }
             for (int t2 = currentToken + 1; t2 < sequenceLength; t2++) {
-                att_row[t2] = (floatX)0.0f;
+                att_row[t2] = (float)0.0f;
             }
         }
     }
@@ -876,7 +1036,7 @@ __global__ void attention_forward_token_kernel(
             const floatX* v_t2 = v_h + t2*headSize;
             acc += probs[t2] * v_t2[d];
         }
-        out_token[d] = (floatX)acc;
+        out_token[d] = (float)acc;
     }
 }
 
@@ -888,18 +1048,21 @@ __global__ void residual_add_token_kernel(floatX* output, const floatX* input1, 
     output[c] = input1[c] + input2[c];
 }
 
-void gpt2_forward_kvcache(
+void gpt2_forward_inference(
     GPT2* model,
     const int* inputs,
+    const int* targets, // targets are optional and could be NULL
     const size_t batchSize,
-    size_t sequenceLength,
+    const size_t contextLength,
+    const size_t maxSequenceLength,
+    const enum Mode mode,
     const size_t currentToken
 ) {
     NVTX_RANGE_FN();
 
     // Keep a safe fallback path for unsupported cases
-    if (batchSize != 1 || currentToken >= sequenceLength || sequenceLength > (size_t)model->seq_len) {
-        gpt2_forward(model, inputs, batchSize, sequenceLength);
+    if (batchSize != 1 || currentToken >= maxSequenceLength || maxSequenceLength > (size_t)model->seq_len) {
+        gpt2_forward(model, inputs, batchSize, maxSequenceLength);
         return;
     }
 
@@ -916,17 +1079,32 @@ void gpt2_forward_kvcache(
     ParameterTensors params = model->params;
     ActivationTensors acts = model->acts;
 
-    constexpr int threadsPerBlock = 256;
-    const int blocksPerGrid = CEIL_DIV(dimensions, threadsPerBlock);
+    const int threadsPerBlock = 256;
+    int blocksPerGrid;
 
-    encoder_forward_cached_kernel<<<blocksPerGrid, threadsPerBlock, 0, main_stream>>>(
-        acts.encoded, model->inputs, params.wte, params.wpe, (int)sequenceLength, (int)dimensions, (int)currentToken);
+    switch (mode) {
+        case TRAIN_VAL: {
+            printf("Using wrong function");
+            break;
+        }
+        case PREFILL: {
+            blocksPerGrid = cuda::std::ceil(contextLength*dimensions/threadsPerBlock);
+            break;
+        }
+        case INFERENCE: {
+            blocksPerGrid = cuda::std::ceil(dimensions/threadsPerBlock);
+            break;
+        }
+    }
+
+    encoder_forward_inference_kernel<<<blocksPerGrid, threadsPerBlock, 0, main_stream>>>(
+        acts.encoded, model->inputs, params.wte, params.wpe, (int)maxSequenceLength, (int)dimensions, (int)currentToken);
     cudaCheck(cudaGetLastError());
 
     for (size_t l = 0; l < numLayers; l++) {
         floatX* residual_tok = (l == 0)
             ? (acts.encoded + currentToken*dimensions)
-            : (acts.residual3 + (l - 1)*sequenceLength*dimensions + currentToken*dimensions);
+            : (acts.residual3 + (l - 1)*maxSequenceLength*dimensions + currentToken*dimensions);
 
         floatX* l_ln1w = params.ln1w + l * dimensions;
         floatX* l_ln1b = params.ln1b + l * dimensions;
@@ -942,42 +1120,42 @@ void gpt2_forward_kvcache(
         floatX* l_fcprojb = params.fcprojb + l * dimensions;
 
         floatX* l_ln1_tok = (model->recompute < 2)
-            ? (acts.ln1 + l*sequenceLength*dimensions + currentToken*dimensions)
+            ? (acts.ln1 + l*maxSequenceLength*dimensions + currentToken*dimensions)
             : (acts.lnf + currentToken*dimensions);
-        float* l_ln1_mean_tok = acts.ln1_mean + l * sequenceLength + currentToken;
-        float* l_ln1_rstd_tok = acts.ln1_rstd + l * sequenceLength + currentToken;
-        floatX* l_qkvr = acts.qkvr + l * sequenceLength * 3 * dimensions;
-        floatX* l_atty = acts.atty + l * sequenceLength * dimensions;
-        floatX* l_att = acts.att + l * numHeads * sequenceLength * sequenceLength;
-        floatX* l_residual2_tok = acts.residual2 + l * sequenceLength * dimensions + currentToken * dimensions;
+        float* l_ln1_mean_tok = acts.ln1_mean + l * maxSequenceLength + currentToken;
+        float* l_ln1_rstd_tok = acts.ln1_rstd + l * maxSequenceLength + currentToken;
+        floatX* l_qkvr = acts.qkvr + l * maxSequenceLength * 3 * dimensions;
+        floatX* l_atty = acts.atty + l * maxSequenceLength * dimensions;
+        floatX* l_att = acts.att + l * numHeads * maxSequenceLength * maxSequenceLength;
+        floatX* l_residual2_tok = acts.residual2 + l * maxSequenceLength * dimensions + currentToken * dimensions;
         floatX* l_ln2_tok = (model->recompute < 2)
-            ? (acts.ln2 + l*sequenceLength*dimensions + currentToken*dimensions)
+            ? (acts.ln2 + l*maxSequenceLength*dimensions + currentToken*dimensions)
             : (acts.lnf + currentToken*dimensions);
-        float* l_ln2_mean_tok = acts.ln2_mean + l * sequenceLength + currentToken;
-        float* l_ln2_rstd_tok = acts.ln2_rstd + l * sequenceLength + currentToken;
-        floatX* l_fch_pre_tok = acts.fch + l * sequenceLength * 4 * dimensions + currentToken*4*dimensions;
+        float* l_ln2_mean_tok = acts.ln2_mean + l * maxSequenceLength + currentToken;
+        float* l_ln2_rstd_tok = acts.ln2_rstd + l * maxSequenceLength + currentToken;
+        floatX* l_fch_pre_tok = acts.fch + l * maxSequenceLength * 4 * dimensions + currentToken*4*dimensions;
         floatX* l_fch_gelu_tok = (model->recompute < 1)
-            ? (acts.fch_gelu + l*sequenceLength*4* dimensions + currentToken*4*dimensions)
+            ? (acts.fch_gelu + l*maxSequenceLength*4* dimensions + currentToken*4*dimensions)
             : (acts.fch_gelu + currentToken*4*dimensions);
-        floatX* l_residual3_tok = acts.residual3 + l*sequenceLength*dimensions + currentToken*dimensions;
+        floatX* l_residual3_tok = acts.residual3 + l*maxSequenceLength*dimensions + currentToken*dimensions;
 
         layernorm_forward(l_ln1_tok, l_ln1_mean_tok, l_ln1_rstd_tok,
                           residual_tok, l_ln1w, l_ln1b,
-                          1, 1, (int)dimensions, main_stream);
+                          batchSize, contextLength, maxSequenceLength, (int)dimensions, mode, main_stream);
 
         floatX* qkv_token = (floatX*)acts.output;
         matmul_forward_cublaslt(qkv_token, l_ln1_tok, l_qkvw, l_qkvb,
                                 1, 1, (int)dimensions, (int)(3 * dimensions), main_stream);
 
-        floatX* q = l_qkvr + 0 * sequenceLength * dimensions;
-        floatX* k = l_qkvr + 1 * sequenceLength * dimensions;
-        floatX* v = l_qkvr + 2 * sequenceLength * dimensions;
+        floatX* q = l_qkvr + 0 * maxSequenceLength * dimensions;
+        floatX* k = l_qkvr + 1 * maxSequenceLength * dimensions;
+        floatX* v = l_qkvr + 2 * maxSequenceLength * dimensions;
         qkv_cache_split<<<blocksPerGrid, threadsPerBlock, 0, main_stream>>>(
-            q, k, v, qkv_token, (int)sequenceLength, (int)dimensions, (int)headSize, (int)currentToken);
+            q, k, v, qkv_token, (int)maxSequenceLength, (int)dimensions, (int)headSize, (int)currentToken);
         cudaCheck(cudaGetLastError());
 
-        attention_forward_token_kernel<<<(int)numHeads, threadsPerBlock, sequenceLength * sizeof(float), main_stream>>>(
-            l_atty, l_att, q, k, v, (int)sequenceLength, (int)dimensions, (int)numHeads, (int)headSize, (int)currentToken);
+        attention_forward_inference_kernel<<<(int)numHeads, threadsPerBlock, maxSequenceLength * sizeof(float), main_stream>>>(
+            l_atty, l_att, q, k, v, (int)maxSequenceLength, (int)dimensions, (int)numHeads, (int)headSize, (int)currentToken);
         cudaCheck(cudaGetLastError());
 
         floatX* attproj_token = (floatX*)acts.output;
@@ -991,7 +1169,7 @@ void gpt2_forward_kvcache(
 
         layernorm_forward(l_ln2_tok, l_ln2_mean_tok, l_ln2_rstd_tok,
                           l_residual2_tok, l_ln2w, l_ln2b,
-                          1, 1, (int)dimensions, main_stream);
+                          batchSize, contextLength, maxSequenceLength, (int)dimensions, mode, main_stream);
 
         matmul_forward_cublaslt(l_fch_gelu_tok, l_ln2_tok, l_fcw, l_fcb,
                                 1, 1, (int)dimensions, (int)(4 * dimensions), main_stream,
@@ -1006,11 +1184,11 @@ void gpt2_forward_kvcache(
         cudaCheck(cudaGetLastError());
     }
 
-    floatX* residual_tok = acts.residual3 + (numLayers - 1) * sequenceLength * dimensions + currentToken * dimensions;
+    floatX* residual_tok = acts.residual3 + (numLayers - 1) * maxSequenceLength * dimensions + currentToken * dimensions;
     floatX* lnf_tok = acts.lnf + currentToken * dimensions;
     layernorm_forward(lnf_tok, acts.lnf_mean + currentToken, acts.lnf_rstd + currentToken,
                       residual_tok, params.lnfw, params.lnfb,
-                      1, 1, (int)dimensions, main_stream);
+                      batchSize, contextLength, maxSequenceLength, (int)dimensions, mode, main_stream);
 
     floatX* logits_tok = acts.output + currentToken * paddedVocabSize;
     matmul_forward_cublaslt(logits_tok, lnf_tok, params.wte, NULL,
@@ -1062,7 +1240,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         // 1) the losses accumulate += into acts.losses, reset here
         // 2) the gradients accumulate += into grads_memory, reset here
         cudaCheck(cudaMemsetAsync(model->acts.losses, 0, model->batch_size * model->seq_len * sizeof(float), main_stream));
-        cudaCheck(cudaMemsetAsync(model->grads_memory, 0, model->num_parameters * sizeof(floatX), main_stream));
+        cudaCheck(cudaMemsetAsync(model->grads_memory, 0, model->num_parameters * sizeof(float), main_stream));
     }
 
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
@@ -1089,7 +1267,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
     // reset residual stream gradients (put here to work with gradient accumulation)
     floatX* dresidual = (floatX*)model->acts.scratch_btc; // the main buffer holding the gradient in the backward pass
-    cudaCheck(cudaMemset(dresidual, 0, B * T * C * sizeof(floatX)));
+    cudaCheck(cudaMemset(dresidual, 0, B * T * C * sizeof(float)));
 
     // re-use the output buffer of the forward pass as a scratchpad during backward pass
     float*  scratchF = (float*)acts.output;
@@ -1164,7 +1342,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion);
         if(model->recompute >= 2) {
             // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
-            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
+            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, T, C, TRAIN_VAL, main_stream);
         }
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
@@ -1182,7 +1360,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
         #endif
         if(model->recompute >= 2) {
-            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, main_stream);
+            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, T, C, TRAIN_VAL, main_stream);
         }
         // QKV parameter gradients
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, main_stream);
@@ -1255,7 +1433,7 @@ ShardInfo gpt2_get_tensor_at_layer(const GPT2 *model, int layer_id, int param_te
 
 float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
     NVTX_RANGE_FN();
-    floatX* grads_memory = (floatX*)model->grads_memory;
+    float* grads_memory = (float*)model->grads_memory;
 
     // repurposing this buffer (which isn't needed now) to write grad norm into it
     float* grad_norm_squared = (float*)model->acts.output;
@@ -1342,8 +1520,8 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         // - the token embeddings are weight shared and participate in the final projection to logits
         // - the position embeddings actively participate at every forward/backward pass
         float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
-        floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
-        floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
+        float* param_ptr = (float*)model->params_memory + local_offset_full;
+        float* grad_ptr = (float*)model->grads_memory + local_offset_full;
 
         ptrdiff_t opt_state_offset = multi_gpu_config->zero_stage < 1 ?  local_offset_full : local_offset_partial;
         float* m_ptr = model->m_memory + opt_state_offset;
@@ -1375,7 +1553,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
             for(int l = 0; l < num_layers; ++l) {
                 // gather updated shards of model->params_memory from each process
                 ncclCheck(ncclAllGather(param_ptr + l * tensor.size,
-                                        (floatX*) model->params_memory + tensor.offset + l * tensor.size,
+                                        (float*) model->params_memory + tensor.offset + l * tensor.size,
                                         shard.size, ncclFloatX,
                                         multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
             }
@@ -1685,18 +1863,49 @@ void write_times(FILE* file, int numTokensGenerated, double totalTimeSeconds, do
 void inference(GPT2* model,
 	Tokenizer* tokenizer,
 	int* prompt,
-	const int batchSize,
-	const int sequenceLength,
+	const int* targets,
+	const size_t batchSize,
+	const size_t contextLength,
+	const size_t maxSequenceLength,
 	uint64_t* rng_state,
-    floatX* cpu_logits_raw,
+    float* cpu_logits_raw,
     float* cpu_logits,
-	FILE* timesFile,
-    FILE* logitsFile
+	FILE* timesFile
 ) {
     struct timespec start, end, ttft;
+    NvtxRange generation_range("Inference prefill");
+    printf("Generating:\n---\n");
     clock_gettime(CLOCK_MONOTONIC, &start);
-    for (int token = 1; token < sequenceLength; token++) {
-        NvtxRange generation_range("Generation step", token);
+    // prefill
+    gpt2_forward_prefill(model, prompt, batchSize, contextLength, maxSequenceLength);
+    floatX* firstTokenLogits = model->acts.output + (contextLength - 1)*model->config.padded_vocab_size;
+   // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
+    cudaCheck(cudaMemcpy(cpu_logits_raw, firstTokenLogits, model->config.vocab_size*sizeof(float), cudaMemcpyDeviceToHost));
+    cudaCheck(cudaDeviceSynchronize());
+    // convert to FP32 into cpu_logits (this does nothing useful if float == float)
+    for (int i = 0; i < model->config.vocab_size; i++) {
+        cpu_logits[i] = (float)cpu_logits_raw[i];
+    }
+    // sample the next token
+    float coin = random_f32(rng_state);
+    int firstOutputToken = sample_softmax(cpu_logits, model->config.vocab_size, coin);
+    clock_gettime(CLOCK_MONOTONIC, &ttft);
+    prompt[contextLength] = firstOutputToken;
+#define PRINT
+#ifdef PRINT
+    // print the generated token, either using the Tokenizer or a fallback
+    if (tokenizer->init_ok) {
+        const char* token_str = tokenizer_decode(tokenizer, firstOutputToken);
+        safe_printf(token_str);
+    } else {
+        // fall back to printing the token id
+        printf("%d ", firstOutputToken);
+    }
+    fflush(stdout);
+#endif
+    // decode
+    for (size_t token = contextLength; token < maxSequenceLength; token++) {
+        NvtxRange generation_range("Inference decode, step", token);
         // we try not to be too wasteful for inference by not calculating all of B,T
         // Using a smaller B is always bit-for-bit identical, but T is more tricky
         // for non-CUDNN, we need to make sure the attention buffer is memset to 0
@@ -1708,32 +1917,28 @@ void inference(GPT2* model,
 #ifndef ENABLE_CUDNN
         if (batchSize == 1) {
             // Decode exactly one position and reuse cached K/V from previous steps
-            gpt2_forward_kvcache(model, prompt, batchSize, sequenceLength, token - 1);
+            gpt2_forward_inference(model, prompt, targets, batchSize, contextLength, maxSequenceLength, INFERENCE, token);
         } else
 #endif
         {
             // Fallback path for unsupported decode modes
-            gpt2_forward(model, prompt, 1, CEIL_DIV(token, min(sequenceLength,256)) * min(sequenceLength,256));
+            gpt2_forward(model, prompt, 1, CEIL_DIV(token, std::min(maxSequenceLength,(size_t)256)) * std::min(maxSequenceLength,(size_t)256));
         }
         // get the V-dimensional vector probs[0, t-1, :]
         floatX* logits = model->acts.output + (token - 1) * model->config.padded_vocab_size;
+        const float dloss = 1.0f / (batchSize * maxSequenceLength); // results in the uniform average loss over all elements
+        if (targets != nullptr) fused_classifier(logits, model->acts.losses, dloss, targets, batchSize, maxSequenceLength, model->config.vocab_size, model->config.padded_vocab_size, False, main_stream);
         // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
-        cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model->config.vocab_size*sizeof(floatX), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model->config.vocab_size*sizeof(float), cudaMemcpyDeviceToHost));
         cudaCheck(cudaDeviceSynchronize());
-        // convert to FP32 into cpu_logits (this does nothing useful if floatX == float)
+        // convert to FP32 into cpu_logits (this does nothing useful if float == float)
         for (int i = 0; i < model->config.vocab_size; i++) {
             cpu_logits[i] = (float)cpu_logits_raw[i];
         }
         // sample the next token
         float coin = random_f32(rng_state);
         int next_token = sample_softmax(cpu_logits, model->config.vocab_size, coin);
-        if (token == 1) clock_gettime(CLOCK_MONOTONIC, &ttft);
         prompt[token] = next_token;
-        // write logits to file to compare
-        if (logitsFile != NULL) {
-            fwrite(cpu_logits, sizeof(float), model->config.vocab_size, logitsFile);
-        }
-#define PRINT
 #ifdef PRINT
         // print the generated token, either using the Tokenizer or a fallback
         if (tokenizer->init_ok) {
@@ -1749,18 +1954,18 @@ void inference(GPT2* model,
     clock_gettime(CLOCK_MONOTONIC, &end);
     double timeTakenSeconds = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 	double timeToFirstTokenMillis = 1e3 * ((ttft.tv_sec - start.tv_sec) + (ttft.tv_nsec - start.tv_nsec) / 1e9);
-	write_times(timesFile, sequenceLength, timeTakenSeconds, timeToFirstTokenMillis);
+	write_times(timesFile, maxSequenceLength, timeTakenSeconds, timeToFirstTokenMillis);
 #define DEBUG
 #ifdef DEBUG
 	printf("Time to first token: %lf ms\n", timeToFirstTokenMillis);
-	printf("\nTime to generate %i tokens: %lf s -> %lf tokens/s\n", sequenceLength, timeTakenSeconds, (double)sequenceLength/timeTakenSeconds);
+	printf("\nTime to generate %zu tokens: %lf s -> %lf tokens/s\n", (size_t)maxSequenceLength, timeTakenSeconds, (double)maxSequenceLength/timeTakenSeconds);
 #endif
 	printf("\n---\n");
 }
 
 // ----------------------------------------------------------------------------
 // main training loop
-int main(int argc, char *argv[]) {
+int main(int argc, char* argv[]) {
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
@@ -2013,7 +2218,7 @@ int main(int argc, char *argv[]) {
 
     // some memory for generating samples from the model
     int* prompt = (int*)mallocCheck(batchSize * sequenceLength * sizeof(int));
-    floatX* cpu_logits_raw = (floatX*)mallocCheck(model.config.vocab_size * sizeof(floatX));
+    float* cpu_logits_raw = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
     float*  cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
     // if we found a checkpoint to resume from, load the optimization state
@@ -2078,6 +2283,27 @@ int main(int argc, char *argv[]) {
 
         // once in a while estimate HellaSwag accuracy (all processes collaborate)
         if (run_hellaswag) {
+            NvtxRange evaluation_range("HellaSwag evaluation");
+            printf("| run hellaswag         | %-50s |\n", run_hellaswag ? "yes" : "no");
+            puts("+-----------------------+----------------------------------------------------+\n");
+            // no multi-GPU so can set index as 0 and total as 1
+            evalloader_init(&eval_loader, hellaswag_path, 4, maxSequenceLength, 0, 1);
+            evalloader_reset(&eval_loader);
+            float cumulativeLoss = 0.f;
+            for (int i = 0; i < val_max_steps; ++i) {
+    			evalloader_next_batch(&eval_loader);
+    			// get the context/input/prompt from the loader
+    			const int contextLength = eval_loader.contextLength;
+    			memcpy(prompt, eval_loader.inputs, contextLength*sizeof(int));
+    			// get the answers/correct tokens from the loader
+    			const int* answer = evalloader_get_answer(&eval_loader);
+    			assert(answer != NULL);
+    			inference(&model, &tokenizer, prompt, answer, 1, contextLength, sequenceLength, &sample_rng_state, cpu_logits_raw, cpu_logits, NULL);
+    			cumulativeLoss += model.mean_loss;
+            }
+            printf("\nGPU Cumulative loss = %lf\n", cumulativeLoss);
+        }
+        /*if (run_hellaswag) {
             NvtxRange evaluation_range("evaluation");
             float eval_acc_norm = 0.0f;
             evalloader_reset(&eval_loader);
@@ -2093,9 +2319,9 @@ int main(int argc, char *argv[]) {
             printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
             logger_log_eval(&logger, step, eval_acc_norm / eval_loader.num_examples);
         }
-
+*/
         // once in a while do model inference to print generated text (only rank 0)
-        if (true) {
+        if (false) {
             NvtxRange generation_range("generation");
             // fill up gen_tokens with the <|endoftext|> token, which kicks off the generation
             int eot_token = tokenizer.eot_token;
@@ -2104,7 +2330,7 @@ int main(int argc, char *argv[]) {
             }
             // now sample from the model autoregressively
             cudaCheck(cudaMemset(model.acts_memory, 0, model.acts_memory_bytes));
-            inference(&model, &tokenizer, prompt, batchSize, sequenceLength, &sample_rng_state, cpu_logits_raw, cpu_logits, timeFile, logitsFile);
+            inference(&model, &tokenizer, prompt, NULL, batchSize, sequenceLength, sequenceLength, &sample_rng_state, cpu_logits_raw, cpu_logits, timeFile);
         }
 
         // once in a while checkpoint the optimization state (all ranks)

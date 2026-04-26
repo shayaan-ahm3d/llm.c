@@ -412,6 +412,7 @@ void evalloader_next_example_(EvalLoader *loader, int example_batch_index) {
     // process the context
     // the context is shared for all completions, so we insert it into all data rows equally
     int context_length = (int)loader->buffer[2];
+    loader->contextLength = context_length; // so I can use from the main file
     uint16_t *context_tokens_start = &loader->buffer[3]; // where the tokens start
     assert(context_length > 0 && context_length < T); // context is non-empty and up to T
     for (int b = 0; b < num_completions; b++) {
@@ -466,29 +467,33 @@ void evalloader_next_batch(EvalLoader *loader) {
     }
 }
 
-// Returns number of examples if not set
-// If numExamples is positive then assume set
-int evalloader_get_answers(int* output, const EvalLoader* loader, const int numExamples) {
-    // Calculate how many examples are currently in the batch
-    const int can_fit_examples = (numExamples >= 0) ? numExamples : loader->B / ASSUMED_NUM_COMPLETIONS;
+// Fills prompt with the context tokens.
+// Could make more effient and not copy later.
+static void evalloader_get_prompts(const EvalLoader* loader, int* prompt) {
+    const int b = 0;
+    for (int token = 0; token < loader->T; ++token) {
+        // mask 0 means it's the prompt bit
+        if (loader->mask[b*loader->T + token] == 0) {
+            prompt[token] = loader->inputs[b*loader->T + token];
+        }
+    }
+}
 
+int* evalloader_get_answer(const EvalLoader* loader) {
+    // Calculate how many examples are currently in the batch
+    const int can_fit_examples = loader->B / ASSUMED_NUM_COMPLETIONS;
+    //should just be 1
     for (int i = 0; i < can_fit_examples; ++i) {
         int correctLabel = loader->label[i];
         int rowIndex = i*ASSUMED_NUM_COMPLETIONS + correctLabel;
-        int tokenCount = 0;
         for (int t = 0; t < loader->T; t++) {
             // The mask is 1 only at the positions of the completion tokens
             if (loader->mask[rowIndex*loader->T + t] == 1) {
-                output[i*loader->T + tokenCount] = loader->targets[rowIndex*loader->T + t];
-                tokenCount++;
+                return loader->targets + rowIndex*loader->T;
             }
         }
-        // keep remaining positions valid token ids for downstream loss code
-        for (int t = tokenCount; t < loader->T; t++) {
-            output[i*loader->T + t] = 0;
-        }
     }
-    return can_fit_examples;
+    return NULL;
 }
 
 int evalloader_stat_losses(EvalLoader *loader, float* losses) {

@@ -21,9 +21,6 @@ FORCE_NVCC_O ?= 3
 
 # NVCC flags
 # -t=0 is short for --threads, 0 = number of CPUs on the machine
-NVMATH_DIR ?=/opt/nvidia/hpc_sdk/Linux_x86_64/24.3/math_libs
-NVMATH_INCLUDES=$(NVMATH_DIR)/include/
-NVMATH_LIBS=$(NVMATH_DIR)/lib64/
 NVCC_FLAGS = --threads=0 -t=0 -std=c++17 -O$(FORCE_NVCC_O) --use_fast_math
 NVCC_LDFLAGS =
 NVCC_INCLUDES =
