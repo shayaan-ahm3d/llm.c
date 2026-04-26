@@ -227,6 +227,52 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
     cudaCheck(cudaGetLastError());
 }
 
+void cached_matmul_forward_kernel(floatX* output,
+    const floatX* input,
+    const floatX* weight,
+    const floatX* bias,
+    const int batchSize,
+    const int maxSequenceLength,
+    const int dimensions,
+    const int outputDimensions,
+    const int currentToken,
+    const cudaStream_t stream,
+    const cublasHandle_t cublasHandle
+) {
+    // use 3*dimensions so it goes over the QKV to get to the next token, otherwise would index into wrong thing
+   	// fill that cache line with the bias values already
+    if (bias != nullptr) {
+        for (int sequence = 0; sequence < batchSize; ++sequence) {
+            floatX* outputPosition = output + sequence*maxSequenceLength*outputDimensions + currentToken*outputDimensions;
+            cudaMemcpyAsync(outputPosition, bias, outputDimensions*sizeof(floatX), cudaMemcpyDeviceToDevice, stream);
+        }
+    }
+    // only adding one token therefore do matrix-vector multiplication and append the result to K & V
+    //   y   =        A        *      x
+    // cache = weight(K or V) * input(token)
+
+    const float alpha = 1.f;
+    const float beta = 1.f;
+    cublasCheck(cublasSgemvStridedBatched(
+        cublasHandle,
+        CUBLAS_OP_T,
+        outputDimensions,
+        dimensions,
+        &alpha,
+        (float*)weight,
+        dimensions,
+        0,
+        (float*)(input + currentToken*dimensions),
+        1,
+        maxSequenceLength*dimensions,
+        &beta,
+        (float*)(output + currentToken*outputDimensions),
+        1,
+        maxSequenceLength*outputDimensions,
+        batchSize
+    ));
+}
+
 // small wrapper around matmul_cublaslt for the forward pass (keeping historical order of arguments)
 void matmul_forward_cublaslt(floatX* out,
                      floatX* inp, floatX* weight, floatX* bias,

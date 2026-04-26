@@ -1,5 +1,5 @@
 CC ?= clang
-CFLAGS = -Ofast -Wno-unused-result -Wno-ignored-pragmas -Wno-unknown-attributes
+CFLAGS = -Ofast
 LDLIBS = -lm -lpthread
 INCLUDES =
 CFLAGS_COND = -march=native
@@ -25,8 +25,8 @@ NVMATH_DIR ?=/opt/nvidia/hpc_sdk/Linux_x86_64/24.3/math_libs
 NVMATH_INCLUDES=$(NVMATH_DIR)/include/
 NVMATH_LIBS=$(NVMATH_DIR)/lib64/
 NVCC_FLAGS = --threads=0 -t=0 -std=c++17 -O$(FORCE_NVCC_O) --use_fast_math
-NVCC_LDFLAGS = -L$(NVMATH_LIBS)
-NVCC_INCLUDES = -I$(NVMATH_INCLUDES)
+NVCC_LDFLAGS =
+NVCC_INCLUDES =
 NVCC_LDLIBS = -lcublas -lcublasLt
 NVCC_CUDNN =
 # By default we don't build with cudnn because it blows up compile time from a few seconds to ~minute

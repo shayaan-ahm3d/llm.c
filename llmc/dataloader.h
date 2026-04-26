@@ -292,7 +292,8 @@ typedef struct {
     int* targets; // target tokens for the transformer
     char* mask; // mask=1 at all completion token locations
     int* label; // the correct completion labels
-    int num_completions; // number of completions for this example
+    int num_completions; // number of completions for this example (4)
+    int contextLength; // length of the context (prompt bit)
 } EvalLoader;
 
 void evalloader_reset(EvalLoader *loader) {

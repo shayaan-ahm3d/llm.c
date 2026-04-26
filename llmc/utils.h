@@ -18,6 +18,12 @@
 #include <arpa/inet.h>
 #endif
 
+enum Mode {
+	TRAIN_VAL = 0,
+	PREFILL = 1,
+	INFERENCE = 2
+};
+
 // ----------------------------------------------------------------------------
 // fread convenience utils, with nice handling of error checking using macros
 // simple replace fopen, fread, fclose, fseek

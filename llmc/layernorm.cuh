@@ -13,6 +13,7 @@ E.g., the layernorms are connected to the residuals so we += in layernorm backwa
 // llmc internal imports
 #include "cuda_common.h"
 #include "cuda_utils.cuh"
+#include "utils.h"
 
 // ----------------------------------------------------------------------------
 // CUDA kernels
@@ -139,9 +140,64 @@ __global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __res
     }
 }
 
-__global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed, float* mean, float* rstd,
-                                               const floatX* inp1, const floatX* inp2,
-                                               const floatX* weight, const floatX* bias,
+__global__ void layernorm_forward_inference_kernel(float* __restrict__ output,
+    float* __restrict__ mean,
+    float* __restrict__ rstd,
+    const float*  __restrict__ input,
+    const float*  __restrict__ weight,
+    const float* __restrict__ bias,
+    const int batchSize,
+    const int maxSequenceLength,
+    const int dimensions,
+    const int currentToken
+) {
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int num_warps = blockDim.x / WARP_SIZE;
+    // which sequence within a batch
+    int sequence = blockIdx.x*num_warps + warp_id;
+    if (sequence >= batchSize) { return; } // guard
+    const int idx = batchSize*maxSequenceLength + currentToken;
+    // the row of input that this group of threads is responsible for
+    const float* x = input + sequence*maxSequenceLength + currentToken*dimensions;
+
+    // mean
+    float sum = 0.0f;
+    for (int i = lane_id; i < dimensions; i += WARP_SIZE) {
+        sum += (float)x[i];
+    }
+    sum = warpReduceSum(sum);
+    float m = sum / dimensions;
+    if(lane_id == 0 && mean != nullptr) {
+        __stcs(mean + idx, m);
+    }
+
+    // rstd
+    sum = 0.0f;
+    for (int i = lane_id; i < dimensions; i += WARP_SIZE) {
+        float diff = x[i] - m;
+        sum += diff * diff;
+    }
+    sum = warpReduceSum(sum);
+    float s = rsqrtf(sum / dimensions + 1e-5f);
+    if(lane_id == 0 && rstd != nullptr) {
+        __stcs(rstd + idx, s);
+    }
+
+    // final normalization and scaling by weight/bias
+    float* o = output + sequence*maxSequenceLength*dimensions + currentToken*dimensions;
+    for (int c = lane_id; c < dimensions; c += WARP_SIZE) {
+        // load and store using the .cs "streaming" hint to the compiler,
+        // indicating that this data will not be reused soon, and can be streamed through the caches
+        // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
+        float n = s*(__ldcs(x + c) - m);
+        __stcs(o + c, (float)(n*(float)weight[c] + (float)bias[c]));
+    }
+}
+
+__global__ void fused_residual_forward_kernel5(float* residual, float* normed, float* mean, float* rstd,
+                                               const float* inp1, const float* inp2,
+                                               const float* weight, const float* bias,
                                                int N, int C) {
     assert(blockDim.x == WARP_SIZE);
 
@@ -430,15 +486,25 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
 // kernel launchers
 
 // similar to `fused_residual_forward5`
-void layernorm_forward(floatX* out, float* mean, float* rstd,
-                       floatX* inp, const floatX* weight, const floatX* bias,
-                       int B, int T, int C, cudaStream_t stream) {
+void layernorm_forward(float* output,
+    float* mean,
+    float* rstd,
+    const float* input,
+    const float* weight,
+    const float* bias,
+    const int batchSize,
+    const int contextLength,
+    const int maxSequenceLength,
+    const int dimensions,
+    const enum Mode mode,
+    const cudaStream_t stream
+) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     int block_y = block_size / WARP_SIZE;
-    const int N = B * T;
+    const int N = batchSize*(mode == PREFILL ? contextLength : maxSequenceLength);
     const int grid_size = CEIL_DIV(N, block_y);
-    size_t smem = (2 + block_y) * C * sizeof(floatX);
+    size_t smem = (2 + block_y) * dimensions * sizeof(float);
 
     // in order to use more than 48 KiB of smem, need to call cudaFuncSetAttribute
     // this may fail, in which case we fall back to the smem free implementation.
@@ -446,45 +512,75 @@ void layernorm_forward(floatX* out, float* mean, float* rstd,
     auto status = cudaFuncSetAttribute(layernorm_forward_kernel6, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     cudaCheck(cudaGetLastError());
     if (status == cudaSuccess) {
-        layernorm_forward_kernel6<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(out, mean, rstd, inp, weight, bias, N, C);
+        layernorm_forward_kernel6<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(output, mean, rstd, input, weight, bias, N, dimensions);
     } else {
         // fall back to the version without shared memory
         const int grid_size_fb = CEIL_DIV(N * WARP_SIZE, block_size);
-        layernorm_forward_kernel3<<<grid_size_fb, block_size, 0, stream>>>(out, mean, rstd, inp, weight, bias, N, C);
+        layernorm_forward_kernel3<<<grid_size_fb, block_size, 0, stream>>>(output, mean, rstd, input, weight, bias, N, dimensions);
     }
     cudaCheck(cudaGetLastError());
 }
 
-void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N, cudaStream_t stream) {
+void residual_forward(float* out,
+    const float* inp1,
+    const float* inp2,
+    const int batchSize,
+    const int contextLength,
+    const int maxSequenceLength,
+    const int dimensions,
+    const enum Mode mode,
+    const int currentToken,
+    const cudaStream_t stream
+) {
     NVTX_RANGE_FN();
     const int block_size = 256;
+    const int N = batchSize*(mode == PREFILL ? contextLength : maxSequenceLength)*dimensions;
     assert(N % (block_size * x128::size) == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
     residual_forward_kernel<<<grid_size, block_size, 0, stream>>>(out, inp1, inp2);
     cudaCheck(cudaGetLastError());
 }
 
-void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, float* rstd,
-                             const floatX* inp1, const floatX* inp2,
-                             const floatX* weight, const floatX* bias,
-                             int N, int C, cudaStream_t stream) {
+void fused_residual_forward5(
+    float* residual,
+    float* normed,
+    float* mean,
+    float* rstd,
+    const float* inp1,
+    const float* inp2,
+    const float* weight,
+    const float* bias,
+    const int batchSize,
+    const int contextLength,
+    const int maxSequenceLength,
+    const int dimensions,
+    const enum Mode mode,
+    const int currentToken,
+    cudaStream_t stream
+) {
     const int block_size = 256;
     int block_y = block_size / WARP_SIZE;
+    int N;
+    switch (mode) {
+        case TRAIN_VAL: N = batchSize*maxSequenceLength*dimensions; break;
+        case PREFILL: N = batchSize*contextLength*dimensions; break;
+        case INFERENCE: N = batchSize*dimensions; break;
+    }
     const int grid_size = CEIL_DIV(N, block_y);
-    size_t smem = (2 + block_y) * C * sizeof(floatX);
+    size_t smem = (2 + block_y) * dimensions * sizeof(float);
 
     // in order to use more than 48 KiB of smem, need to call cudaFuncSetAttribute
     // this may fail, in which case we fall back to the smem free implementation.
     cudaCheck(cudaGetLastError());
     auto status = cudaFuncSetAttribute(fused_residual_forward_kernel5, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     cudaCheck(cudaGetLastError());
-    if(status == cudaSuccess) {
+    if (status == cudaSuccess) {
         fused_residual_forward_kernel5<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(residual, normed,
                                                                                               mean, rstd, inp1, inp2,
-                                                                                              weight, bias, N, C);
+                                                                                              weight, bias, N, dimensions);
     } else {
-        residual_forward(residual, inp1, inp2, N*C, stream);
-        layernorm_forward(normed, mean, rstd, residual, weight, bias, N, 1, C, stream);
+        residual_forward(residual, inp1, inp2, batchSize, contextLength, maxSequenceLength, dimensions, mode, currentToken, stream);
+        layernorm_forward(normed, mean, rstd, residual, weight, bias, batchSize, contextLength, maxSequenceLength, dimensions, mode, stream);
     }
     cudaCheck(cudaGetLastError());
 }
