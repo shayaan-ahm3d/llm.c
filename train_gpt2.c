@@ -20,7 +20,7 @@ There will be other versions of this code that specialize it and make it fast.
 #ifdef OMP
 #include <omp.h>
 #endif
-#include <blis.h>
+#include <blis/blis.h>
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 #include "llmc/utils.h"
@@ -30,11 +30,6 @@ There will be other versions of this code that specialize it and make it fast.
 #include "llmc/dataloader.h"
 // defines: logger_init, logger_log_eval
 #include "llmc/logger.h"
-
-enum Mode {
-	TRAIN_VAL = 0,
-	INFERENCE = 1
-};
 
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
@@ -80,7 +75,8 @@ void encoder_forward(
     const float* weightTokenEmbeddings,
     const float* weightPositionalEmbeddings,
     const int batchSize,
-    const int sequenceLength,
+    const int contextLength,
+    const int maxSequenceLength,
     const int dimensions,
     const enum Mode mode,
     const int currentToken
@@ -97,11 +93,11 @@ void encoder_forward(
     	case TRAIN_VAL: {
 	   		#pragma omp parallel for collapse(2)
 	        for (int sequence = 0; sequence < batchSize; sequence++) {
-	            for (int token = 0; token < sequenceLength; token++) {
+	            for (int token = 0; token < maxSequenceLength; token++) {
 	                // seek to the output position in out[b,t,:]
-	                float* outputPosition = output + sequence*sequenceLength*dimensions + token*dimensions;
+	                float* outputPosition = output + sequence*maxSequenceLength*dimensions + token*dimensions;
 	                // get the index of the token at inp[b, t]
-	                const int tokenIndex = tokenIdsAtPosition[sequence*sequenceLength + token];
+	                const int tokenIndex = tokenIdsAtPosition[sequence*maxSequenceLength + token];
 	                // seek to the position in wte corresponding to the token
 	                const float* wte_ix = weightTokenEmbeddings + tokenIndex*dimensions;
 	                // seek to the position in wpe corresponding to the position
@@ -115,13 +111,34 @@ void encoder_forward(
 	        }
      		break;
      	}
+      	case PREFILL: {
+     		#pragma omp parallel for collapse(2)
+	        for (int sequence = 0; sequence < batchSize; sequence++) {
+	            for (int token = 0; token < contextLength; token++) {
+	                // seek to the output position in out[b,t,:]
+	                float* outputPosition = output + sequence*maxSequenceLength*dimensions + token*dimensions;
+	                // get the index of the token at inp[b, t]
+	                const int tokenIndex = tokenIdsAtPosition[sequence*maxSequenceLength + token];
+	                // seek to the position in wte corresponding to the token
+	                const float* wte_ix = weightTokenEmbeddings + tokenIndex*dimensions;
+	                // seek to the position in wpe corresponding to the position
+	                const float* wpe_t = weightPositionalEmbeddings + token*dimensions;
+	                // add the two vectors and store the result in out[b,t,:]
+
+	                for (int i = 0; i < dimensions; i++) {
+	                    outputPosition[i] = wte_ix[i] + wpe_t[i];
+	                }
+	            }
+	        }
+       		break;
+       	}
       	case INFERENCE: {
        		#pragma omp parallel for
 	        for (int sequence = 0; sequence < batchSize; sequence++) {
                 // seek to the output position in out[b,t,:]
-                float* outputPosition = output + sequence*sequenceLength*dimensions + currentToken*dimensions;
+                float* outputPosition = output + sequence*maxSequenceLength*dimensions + currentToken*dimensions;
                 // get the index of the token at inp[b, t]
-                const int tokenIndex = tokenIdsAtPosition[sequence*sequenceLength + currentToken];
+                const int tokenIndex = tokenIdsAtPosition[sequence*maxSequenceLength + currentToken];
                 // seek to the position in wte corresponding to the token
                 const float* wte_ix = weightTokenEmbeddings + tokenIndex*dimensions;
                 // seek to the position in wpe corresponding to the position
@@ -163,7 +180,8 @@ void layernorm_forward(
 	const float* weight,
 	const float* bias,
 	const int batchSize,
-	const int sequenceLength,
+	const int contextLength,
+	const int maxSequenceLength,
 	const int dimensions,
 	const enum Mode mode,
 	const int currentToken
@@ -179,9 +197,9 @@ void layernorm_forward(
     	case TRAIN_VAL: {
     		#pragma omp parallel for collapse(2)
          	for (int sequence = 0; sequence < batchSize; sequence++) {
-             	for (int token = 0; token < sequenceLength; token++) {
+             	for (int token = 0; token < maxSequenceLength; token++) {
 	              	// seek to the input position inp[b,t,:]
-	                const float* x = input + sequence*sequenceLength*dimensions + token*dimensions;
+	                const float* x = input + sequence*maxSequenceLength*dimensions + token*dimensions;
 	                // calculate the mean
 	                float m = 0.0f;
 
@@ -200,7 +218,7 @@ void layernorm_forward(
 	                // calculate the rstd (reciprocal standard deviation)
 	                const float s = 1.0f / sqrtf(v + eps);
 	                // seek to the output position in out[b,t,:]
-	                float* out_bt = output + sequence*sequenceLength*dimensions + token*dimensions;
+	                float* out_bt = output + sequence*maxSequenceLength*dimensions + token*dimensions;
 
 	                for (int i = 0; i < dimensions; i++) {
 	                    const float n = (s * (x[i] - m)); // normalize
@@ -208,17 +226,55 @@ void layernorm_forward(
 	                    out_bt[i] = o; // write
 	                }
 	                // cache the mean and rstd for the backward pass later
-	                mean[sequence*sequenceLength + token] = m;
-	                rstd[sequence*sequenceLength + token] = s;
+	                mean[sequence*maxSequenceLength + token] = m;
+	                rstd[sequence*maxSequenceLength + token] = s;
               	}
           	}
           	break;
      	}
+      	case PREFILL: {
+     		#pragma omp parallel for collapse(2)
+           	for (int sequence = 0; sequence < batchSize; sequence++) {
+               	for (int token = 0; token < contextLength; token++) {
+	                // seek to the input position inp[b,t,:]
+		            const float* x = input + sequence*maxSequenceLength*dimensions + token*dimensions;
+		            // calculate the mean
+		            float m = 0.0f;
+
+		            for (int i = 0; i < dimensions; i++) {
+		                m += x[i];
+		            }
+		            m /= dimensions;
+		            // calculate the variance (without any bias correction)
+		            float v = 0.0f;
+
+		            for (int i = 0; i < dimensions; i++) {
+		                const float xshift = x[i] - m;
+		                v += xshift * xshift;
+		            }
+		            v /= dimensions;
+		            // calculate the rstd (reciprocal standard deviation)
+		            const float s = 1.0f / sqrtf(v + eps);
+		            // seek to the output position in out[b,t,:]
+		            float* out_bt = output + sequence*maxSequenceLength*dimensions + token*dimensions;
+
+		            for (int i = 0; i < dimensions; i++) {
+		                const float n = (s * (x[i] - m)); // normalize
+		                const float o = n * weight[i] + bias[i]; // scale and shift
+		                out_bt[i] = o; // write
+		            }
+		            // cache the mean and rstd for the backward pass later
+		            mean[sequence*maxSequenceLength + token] = m;
+		            rstd[sequence*maxSequenceLength + token] = s;
+               	}
+           	}
+           	break;
+       	}
       	case INFERENCE: {
        		#pragma omp parallel for
            	for (int sequence = 0; sequence < batchSize; sequence++) {
 		       	// seek to the input position inp[b,t,:]
-		        const float* x = input + sequence*sequenceLength*dimensions + currentToken*dimensions;
+		        const float* x = input + sequence*maxSequenceLength*dimensions + currentToken*dimensions;
 		        // calculate the mean
 		        float m = 0.0f;
 
@@ -237,7 +293,7 @@ void layernorm_forward(
 		        // calculate the rstd (reciprocal standard deviation)
 		        const float s = 1.0f / sqrtf(v + eps);
 		        // seek to the output position in out[b,t,:]
-		        float* out_bt = output + sequence*sequenceLength*dimensions + currentToken*dimensions;
+		        float* out_bt = output + sequence*maxSequenceLength*dimensions + currentToken*dimensions;
 
 		        for (int i = 0; i < dimensions; i++) {
 		            const float n = (s * (x[i] - m)); // normalize
@@ -245,8 +301,8 @@ void layernorm_forward(
 		            out_bt[i] = o; // write
 		        }
 		        // cache the mean and rstd for the backward pass later
-		        mean[sequence*sequenceLength + currentToken] = m;
-		        rstd[sequence*sequenceLength + currentToken] = s;
+		        mean[sequence*maxSequenceLength + currentToken] = m;
+		        rstd[sequence*maxSequenceLength + currentToken] = s;
            	}
            	break;
        	}
@@ -302,7 +358,8 @@ void matmul_forward_naive(
     const float* weight,
     const float* bias,
     const int batchSize,
-    const int sequenceLength,
+    const int contextLength,
+    const int maxSequenceLength,
     const int dimensions,
     const int outputDimensions,
     const enum Mode mode,
@@ -318,8 +375,8 @@ void matmul_forward_naive(
 	   		for (int sequence = 0; sequence < batchSize; ++sequence) {
 	          	if (bias != NULL) {
 	           		// fill matrix with bias terms already
-	          		for (int token = 0; token < sequenceLength; ++token) {
-	          			const int index = sequence*sequenceLength*outputDimensions + token*outputDimensions;
+	          		for (int token = 0; token < maxSequenceLength; ++token) {
+	          			const int index = sequence*maxSequenceLength*outputDimensions + token*outputDimensions;
 	          			memcpy(output+index, bias, outputDimensions*sizeof(float));
 	             	}
 	           	}
@@ -328,25 +385,53 @@ void matmul_forward_naive(
 	         	cblas_sgemm(CblasRowMajor,
 	          	CblasNoTrans,
 	           	CblasTrans,
-	          	sequenceLength,
+	          	maxSequenceLength,
 	           	outputDimensions,
 	            dimensions,
 	          	1.f,
-	           	input + sequence*sequenceLength*dimensions,
+	           	input + sequence*maxSequenceLength*dimensions,
 	            dimensions,
 	            weight,
 	            dimensions,
-	            1.f,
-	            output + sequence*sequenceLength*outputDimensions,
+	            bias != NULL ? 1.f : 0.f,
+	            output + sequence*maxSequenceLength*outputDimensions,
 	            outputDimensions);
 	        }
      		break;
      	}
+      	case PREFILL: {
+       		for (int sequence = 0; sequence < batchSize; ++sequence) {
+	          	if (bias != NULL) {
+	           		// fill matrix with bias terms already
+	          		for (int token = 0; token < contextLength; ++token) {
+	          			const int index = sequence*maxSequenceLength*outputDimensions + token*outputDimensions;
+	          			memcpy(output+index, bias, outputDimensions*sizeof(float));
+	             	}
+	           	}
+	         	//    C   =    A   *    B      + C
+	         	// output = input * weight.T + output
+	         	cblas_sgemm(CblasRowMajor,
+	          	CblasNoTrans,
+	           	CblasTrans,
+	          	contextLength,
+	           	outputDimensions,
+	            dimensions,
+	          	1.f,
+	           	input + sequence*maxSequenceLength*dimensions,
+	            dimensions,
+	            weight,
+	            dimensions,
+	            bias != NULL ? 1.f : 0.f,
+	            output + sequence*maxSequenceLength*outputDimensions,
+	            outputDimensions);
+	        }
+            break;
+       	}
      	case INFERENCE: {
       		for (int sequence = 0; sequence < batchSize; ++sequence) {
 	          	if (bias != NULL) {
 	           		// fill matrix with bias terms already
-	          		const int index = sequence*sequenceLength*outputDimensions + currentToken*outputDimensions;
+	          		const int index = sequence*maxSequenceLength*outputDimensions + currentToken*outputDimensions;
 	          		memcpy(output + index, bias, outputDimensions*sizeof(float));
 	           	}
 	         	//    C   =    A   *    B      + C
@@ -358,12 +443,12 @@ void matmul_forward_naive(
 	           	outputDimensions,
 	            dimensions,
 	          	1.f,
-	           	input + sequence*sequenceLength*dimensions + currentToken*dimensions,
+	           	input + sequence*maxSequenceLength*dimensions + currentToken*dimensions,
 	            dimensions,
 	            weight,
 	            dimensions,
-	            1.f,
-	            output + sequence*sequenceLength*outputDimensions + currentToken*outputDimensions,
+	            bias != NULL ? 1.f : 0.f,
+	            output + sequence*maxSequenceLength*outputDimensions + currentToken*outputDimensions,
 	            outputDimensions);
 	        }
       		break;
@@ -389,7 +474,8 @@ void matmul_forward(
     const float* weight,
     const float* bias,
     const int batchSize,
-    const int sequenceLength,
+    const int contextLength,
+    const int maxSequenceLength,
     const int dimensions,
     const int outputDimensions,
     const enum Mode mode,
@@ -403,18 +489,18 @@ void matmul_forward(
     // out will be (B,T,OC)
     // make sure the tiled loop will be correct or fallback to naive version
 
-    matmul_forward_naive(out, inp, weight, bias, batchSize, sequenceLength, dimensions, outputDimensions, mode, currentToken);
+    matmul_forward_naive(out, inp, weight, bias, batchSize, contextLength, maxSequenceLength, dimensions, outputDimensions, mode, currentToken);
     return;
     const int LOOP_UNROLL = 8;
-    if (batchSize*sequenceLength % LOOP_UNROLL != 0) {
-        matmul_forward_naive(out, inp, weight, bias, batchSize, sequenceLength, dimensions, outputDimensions, mode, currentToken);
+    if (batchSize*maxSequenceLength % LOOP_UNROLL != 0) {
+        matmul_forward_naive(out, inp, weight, bias, batchSize, contextLength, maxSequenceLength, dimensions, outputDimensions, mode, currentToken);
         return;
     }
 
     // collapse the B and T loops into one and turn it into a strided loop.
     // then we can tile the inner loop, and reuse the loaded weight LOOP_UNROLL many times
     #pragma omp parallel for
-    for (int obt = 0; obt < batchSize * sequenceLength; obt += LOOP_UNROLL) {
+    for (int obt = 0; obt < batchSize * maxSequenceLength; obt += LOOP_UNROLL) {
         for (int o = 0; o < outputDimensions; o++) {
             // we'll keep LOOP_UNROLL many results in registers
             float result[LOOP_UNROLL];
@@ -496,23 +582,23 @@ void cached_matmul_forward(
     const int batchSize,
     const int sequenceLength,
     const int dimensions,
-    const int outputDimensions,
+    const int outputStride,
     const enum Mode mode,
     const int currentToken
 ) {
 	assert(mode == INFERENCE);
-    assert(dimensions == outputDimensions);
+    assert(3*dimensions == outputStride);
     for (int sequence = 0; sequence < batchSize; ++sequence) {
     	// use 3*dimensions so it goes over the QKV to get to the next token, otherwise would index into wrong thing
     	// fill that cache line with the bias values already
-        memcpy(output + sequence*sequenceLength*3*dimensions + currentToken*3*dimensions, bias, dimensions*sizeof(float));
+        memcpy(output + sequence*sequenceLength*outputStride + currentToken*outputStride, bias, dimensions*sizeof(float));
 
         // only adding one token therefore do matrix-vector multiplication and append the result to K & V
         //   y   =        A        *      x
         // cache = weight(K or V) * input(token)
         cblas_sgemv(CblasRowMajor, // row-major in C
         CblasNoTrans,
-        outputDimensions, // rows of weight matrix W
+        dimensions, // rows of weight matrix W
         dimensions, // cols of weight matrix W
         1.f,
         weight, // weight matrix W(k) or W(v)
@@ -520,18 +606,19 @@ void cached_matmul_forward(
         input + sequence*sequenceLength*dimensions + currentToken*dimensions, // current token
         1, // increment for token vector
         1.f,
-        output + sequence*sequenceLength*3*dimensions + currentToken*3*dimensions, // output to the cache
+        output + sequence*sequenceLength*outputStride + currentToken*outputStride, // output to the cache
         1); // increment for cache vector
     }
 }
 
 void attention_forward(
-	float* out,
-	float* preatt,
-	float* att,
+	float* output,
+	float* preattention,
+	float* attention,
     const float* qkv,
     const int batchSize,
-    const int sequenceLength,
+    const int contextLength,
+    const int maxSequenceLength,
     const int dimensions,
     const int numHeads,
     const enum Mode mode,
@@ -553,11 +640,11 @@ void attention_forward(
 	  		// already does parallel attention prefill
 	        #pragma omp parallel for collapse(3)
 	        for (int sequence = 0; sequence < batchSize; sequence++) {
-	            for (int token = 0; token <  sequenceLength; token++) {
+	            for (int token = 0; token <  maxSequenceLength; token++) {
 	                for (int head = 0; head < numHeads; head++) {
-	                    const float* query_t = qkv + sequence*sequenceLength*C3 + token*C3 + head*headSize;
-	                    float* preatt_bth = preatt + sequence*numHeads*sequenceLength*sequenceLength + head*sequenceLength*sequenceLength + token*sequenceLength;
-	                    float* att_bth = att + sequence*numHeads*sequenceLength*sequenceLength + head*sequenceLength*sequenceLength + token*sequenceLength;
+	                    const float* query_t = qkv + sequence*maxSequenceLength*C3 + token*C3 + head*headSize;
+	                    float* preatt_bth = preattention + sequence*numHeads*maxSequenceLength*maxSequenceLength + head*maxSequenceLength*maxSequenceLength + token*maxSequenceLength;
+	                    float* att_bth = attention + sequence*numHeads*maxSequenceLength*maxSequenceLength + head*maxSequenceLength*maxSequenceLength + token*maxSequenceLength;
 
 	                    // pass 1: calculate query dot key and maxval
 	                    float maxval = -10000.0f; // TODO something better
@@ -565,7 +652,7 @@ void attention_forward(
 
 	                    for (int t2 = 0; t2 <= token; t2++) {
 	                    	// query is t but key is t2 as key requires full history of previous tokens, whereas query just requires current
-	                        const float* key_t2 = qkv + sequence*sequenceLength*C3 + t2*C3 + head*headSize + dimensions; // +dimensions because it's key
+	                        const float* key_t2 = qkv + sequence*maxSequenceLength*C3 + t2*C3 + head*headSize + dimensions; // +dimensions because it's key
 
 	                        // (query_t) dot (key_t2)
 	                        float val = 0.0f;
@@ -593,7 +680,7 @@ void attention_forward(
 
 	                    // pass 3: normalize to get the softmax
 
-	                    for (int t2 = 0; t2 <= sequenceLength - 1; t2++) {
+	                    for (int t2 = 0; t2 <= maxSequenceLength - 1; t2++) {
 	                        if (t2 <= token) {
 	                            att_bth[t2] *= expsum_inv;
 	                        } else {
@@ -604,7 +691,7 @@ void attention_forward(
 	                    }
 
 	                    // pass 4: accumulate weighted values into the output of attention
-	                    float* out_bth = out + sequence*sequenceLength*dimensions + token*dimensions + head*headSize;
+	                    float* out_bth = output + sequence*maxSequenceLength*dimensions + token*dimensions + head*headSize;
 
                         for (int i = 0; i < headSize; i++) {
 	                    	out_bth[i] = 0.0f;
@@ -612,7 +699,7 @@ void attention_forward(
 	                    for (int t2 = 0; t2 <= token; t2++) {
 	                        for (int i = 0; i < headSize; i++) {
 	                            const float att_btht2 = att_bth[t2];
-	                            const float* value_t2 = qkv + sequence*sequenceLength*C3 + t2*C3 + head*headSize + dimensions*2; // +dimensions*2 because it's value
+	                            const float* value_t2 = qkv + sequence*maxSequenceLength*C3 + t2*C3 + head*headSize + dimensions*2; // +dimensions*2 because it's value
 	                            out_bth[i] += att_btht2 * value_t2[i];
 	                        }
 	                    }
@@ -621,13 +708,84 @@ void attention_forward(
 	        }
      		break;
      	}
+      	case PREFILL: {
+       		#pragma omp parallel for collapse(3)
+	        for (int sequence = 0; sequence < batchSize; sequence++) {
+	            for (int token = 0; token < contextLength; token++) {
+	                for (int head = 0; head < numHeads; head++) {
+	                    const float* query_t = qkv + sequence*maxSequenceLength*C3 + token*C3 + head*headSize;
+	                    float* preatt_bth = preattention + sequence*numHeads*maxSequenceLength*maxSequenceLength + head*maxSequenceLength*maxSequenceLength + token*maxSequenceLength;
+	                    float* att_bth = attention + sequence*numHeads*maxSequenceLength*maxSequenceLength + head*maxSequenceLength*maxSequenceLength + token*maxSequenceLength;
+
+	                    // pass 1: calculate query dot key and maxval
+	                    float maxval = -10000.0f; // TODO something better
+	                    // this loop iterates over all previous elements in K
+
+	                    for (int t2 = 0; t2 <= token; t2++) {
+	                    	// query is t but key is t2 as key requires full history of previous tokens, whereas query just requires current
+	                        const float* key_t2 = qkv + sequence*maxSequenceLength*C3 + t2*C3 + head*headSize + dimensions; // +dimensions because it's key
+
+	                        // (query_t) dot (key_t2)
+	                        float val = 0.0f;
+	                        for (int i = 0; i < headSize; i++) {
+	                            val += query_t[i] * key_t2[i];
+	                        }
+	                        val *= scale;
+	                        if (val > maxval) {
+	                            maxval = val;
+	                        }
+
+	                        preatt_bth[t2] = val;
+	                    }
+
+	                    // pass 2: calculate the exp and keep track of sum
+	                    // maxval is being calculated and subtracted only for numerical stability
+	                    float expsum = 0.0f;
+
+	                    for (int t2 = 0; t2 <= token; t2++) {
+	                        float expv = expf(preatt_bth[t2] - maxval);
+	                        expsum += expv;
+	                        att_bth[t2] = expv;
+	                    }
+	                    float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
+
+	                    // pass 3: normalize to get the softmax
+
+	                    for (int t2 = 0; t2 <= maxSequenceLength - 1; t2++) {
+	                        if (t2 <= token) {
+	                            att_bth[t2] *= expsum_inv;
+	                        } else {
+	                            // causal attention mask. not strictly necessary to set to zero here
+	                            // only doing this explicitly for debugging and checking to PyTorch
+	                            att_bth[t2] = 0.0f;
+	                        }
+	                    }
+
+	                    // pass 4: accumulate weighted values into the output of attention
+	                    float* out_bth = output + sequence*maxSequenceLength*dimensions + token*dimensions + head*headSize;
+
+                        for (int i = 0; i < headSize; i++) {
+	                    	out_bth[i] = 0.0f;
+	                    }
+	                    for (int t2 = 0; t2 <= token; t2++) {
+	                        for (int i = 0; i < headSize; i++) {
+	                            const float att_btht2 = att_bth[t2];
+	                            const float* value_t2 = qkv + sequence*maxSequenceLength*C3 + t2*C3 + head*headSize + dimensions*2; // +dimensions*2 because it's value
+	                            out_bth[i] += att_btht2 * value_t2[i];
+	                        }
+	                    }
+	                }
+	            }
+	        }
+			break;
+       	}
       	case INFERENCE: {
      		#pragma omp parallel for collapse(2)
 	        for (int sequence = 0; sequence < batchSize; sequence++) {
                 for (int head = 0; head < numHeads; head++) {
-                    const float* query_t = qkv + sequence*sequenceLength*C3 + currentToken*C3 + head*headSize;
-                    float* preatt_bth = preatt + sequence*numHeads*sequenceLength*sequenceLength + head*sequenceLength*sequenceLength + currentToken*sequenceLength;
-                    float* att_bth = att + sequence*numHeads*sequenceLength*sequenceLength + head*sequenceLength*sequenceLength + currentToken*sequenceLength;
+                    const float* query_t = qkv + sequence*maxSequenceLength*C3 + currentToken*C3 + head*headSize;
+                    float* preatt_bth = preattention + sequence*numHeads*maxSequenceLength*maxSequenceLength + head*maxSequenceLength*maxSequenceLength + currentToken*maxSequenceLength;
+                    float* att_bth = attention + sequence*numHeads*maxSequenceLength*maxSequenceLength + head*maxSequenceLength*maxSequenceLength + currentToken*maxSequenceLength;
 
                     // pass 1: calculate query dot key and maxval
                     float maxval = -10000.0f; // TODO something better
@@ -635,7 +793,7 @@ void attention_forward(
 
                     for (int t2 = 0; t2 <= currentToken; t2++) {
                     	// query is t but key is t2 as key requires full history of previous tokens, whereas query just requires current
-                        const float* key_t2 = qkv + sequence*sequenceLength*C3 + t2*C3 + head*headSize + dimensions; // +dimensions because it's key
+                        const float* key_t2 = qkv + sequence*maxSequenceLength*C3 + t2*C3 + head*headSize + dimensions; // +dimensions because it's key
 
                         // (query_t) dot (key_t2)
                         float val = 0.0f;
@@ -674,14 +832,14 @@ void attention_forward(
                     }
 
                     // pass 4: accumulate weighted values into the output of attention
-                    float* out_bth = out + sequence*sequenceLength*dimensions + currentToken*dimensions + head*headSize;
+                    float* out_bth = output + sequence*maxSequenceLength*dimensions + currentToken*dimensions + head*headSize;
 
                     for (int i = 0; i < headSize; i++) {
                     	out_bth[i] = 0.0f;
                     }
                     for (int t2 = 0; t2 <= currentToken; t2++) {
                         for (int i = 0; i < headSize; i++) {
-                            const float* value_t2 = qkv + sequence*sequenceLength*C3 + t2*C3 + head*headSize + dimensions*2; // +dimensions*2 because it's value
+                            const float* value_t2 = qkv + sequence*maxSequenceLength*C3 + t2*C3 + head*headSize + dimensions*2; // +dimensions*2 because it's value
                             const float att_btht2 = att_bth[t2];
                             out_bth[i] += att_btht2 * value_t2[i];
                         }
@@ -691,9 +849,6 @@ void attention_forward(
        		break;
        	}
     }
-
-
-
 }
 
 void attention_backward(float* dinp, float* dpreatt, float* datt,
@@ -761,7 +916,8 @@ void gelu_forward(
 	float* out,
 	const float* const inp,
 	const int batchSize,
-	const int sequenceLength,
+	const int contextLength,
+	const int maxSequenceLength,
 	const int dimensions,
 	const enum Mode mode,
 	const int currentToken
@@ -769,18 +925,31 @@ void gelu_forward(
 	// (approximate) GeLU elementwise non-linearity in the MLP block of Transformer
 	switch (mode) {
 		case TRAIN_VAL: {
-
-    		for (int i = 0; i < batchSize*sequenceLength*dimensions; i++) {
+    		for (int i = 0; i < batchSize*maxSequenceLength*dimensions; i++) {
         		const float x = inp[i];
           		const float cube = 0.044715f * x * x * x;
             	out[i] = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
       		}
 			break;
 		}
+		case PREFILL: {
+			#pragma omp parallel for collapse(2)
+			for (int sequence = 0; sequence < batchSize; sequence++) {
+				for (int token = 0; token < contextLength; ++token) {
+	      			for (int dim = 0; dim < dimensions; dim++) {
+	         			const int index = sequence*maxSequenceLength*dimensions + token*dimensions + dim;
+	            		const float x = inp[index];
+	                    const float cube = 0.044715f * x * x * x;
+	                    out[index] = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
+	         		}
+				}
+      		}
+			break;
+		}
 		case INFERENCE: {
     		for (int sequence = 0; sequence < batchSize; sequence++) {
       			for (int dim = 0; dim < dimensions; dim++) {
-         			const int index = sequence*sequenceLength*dimensions + currentToken*dimensions + dim;
+         			const int index = sequence*maxSequenceLength*dimensions + currentToken*dimensions + dim;
             		const float x = inp[index];
                     const float cube = 0.044715f * x * x * x;
                     out[index] = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
@@ -816,7 +985,8 @@ void residual_forward(
 	const float* inp1,
 	const float* inp2,
 	const int batchSize,
-	const int sequenceLength,
+	const int contextLength,
+	const int maxSequenceLength,
 	const int dimensions,
 	const enum Mode mode,
 	const int currentToken
@@ -824,15 +994,27 @@ void residual_forward(
 	switch (mode) {
 		case TRAIN_VAL: {
 
-    		for (int i = 0; i < batchSize*sequenceLength*dimensions; i++) {
+    		for (int i = 0; i < batchSize*maxSequenceLength*dimensions; i++) {
         		out[i] = inp1[i] + inp2[i];
       		}
+			break;
+		}
+		case PREFILL: {
+			#pragma omp parallel for collapse(2)
+			for (int sequence = 0; sequence < batchSize; ++sequence) {
+				for (int token = 0; token < contextLength; ++token) {
+					for (int dim = 0; dim < dimensions; ++dim) {
+						const int index = sequence*maxSequenceLength*dimensions + token*dimensions + dim;
+	        			out[index] = inp1[index] + inp2[index];
+	      			}
+				}
+			}
 			break;
 		}
 		case INFERENCE: {
 			for (int sequence = 0; sequence < batchSize; ++sequence) {
 				for (int dim = 0; dim < dimensions; ++dim) {
-					const int index = sequence*sequenceLength*dimensions + currentToken*dimensions + dim;
+					const int index = sequence*maxSequenceLength*dimensions + currentToken*dimensions + dim;
         			out[index] = inp1[index] + inp2[index];
       			}
 			}
@@ -852,7 +1034,8 @@ void softmax_forward(
 	float* probs,
 	const float* logits,
 	const int batchSize,
-	const int sequenceLength,
+	const int contextLength,
+	const int maxSequenceLength,
 	const int vocabSize,
 	const int paddedVocabSize,
 	const enum Mode mode,
@@ -867,10 +1050,10 @@ void softmax_forward(
     	case TRAIN_VAL: {
      		#pragma omp parallel for collapse(2)
 	        for (int sequence = 0; sequence < batchSize; sequence++) {
-	            for (int token = 0; token < sequenceLength; token++) {
+	            for (int token = 0; token < maxSequenceLength; token++) {
 	                // probs <- softmax(logits)
-	                const float* logits_bt = logits + sequence*sequenceLength*paddedVocabSize + token*paddedVocabSize;
-	                float* probs_bt = probs + sequence*sequenceLength*paddedVocabSize + token*paddedVocabSize;
+	                const float* logits_bt = logits + sequence*maxSequenceLength*paddedVocabSize + token*paddedVocabSize;
+	                float* probs_bt = probs + sequence*maxSequenceLength*paddedVocabSize + token*paddedVocabSize;
 
 	                // maxval is only calculated and subtracted for numerical stability
 	                float maxval = -10000.0f; // TODO something better
@@ -901,12 +1084,49 @@ void softmax_forward(
 	        }
      		break;
      	}
+      	case PREFILL: {
+     		#pragma omp parallel for collapse(2)
+	        for (int sequence = 0; sequence < batchSize; sequence++) {
+	            for (int token = 0; token < contextLength; token++) {
+	                // probs <- softmax(logits)
+	                const float* logits_bt = logits + sequence*maxSequenceLength*paddedVocabSize + token*paddedVocabSize;
+	                float* probs_bt = probs + sequence*maxSequenceLength*paddedVocabSize + token*paddedVocabSize;
+
+	                // maxval is only calculated and subtracted for numerical stability
+	                float maxval = -10000.0f; // TODO something better
+
+	                for (int i = 0; i < vocabSize; i++) {
+	                    if (logits_bt[i] > maxval) {
+	                        maxval = logits_bt[i];
+	                    }
+	                }
+	                float sum = 0.0f;
+
+	                for (int i = 0; i < vocabSize; i++) {
+	                    probs_bt[i] = expf(logits_bt[i] - maxval);
+	                    sum += probs_bt[i];
+	                }
+	                // note we only loop to V, leaving the padded dimensions
+
+	                for (int i = 0; i < vocabSize; i++) {
+	                    probs_bt[i] /= sum;
+	                }
+	                // for extra super safety we may wish to include this too,
+	                // forcing the probabilities here to be zero, but it shouldn't matter
+
+	                for (int i = vocabSize; i < paddedVocabSize; i++) {
+	                    probs_bt[i] = 0.0f;
+	                }
+	            }
+	        }
+			break;
+       	}
       	case INFERENCE: {
      		#pragma omp parallel for
 	        for (int sequence = 0; sequence < batchSize; sequence++) {
                 // probs <- softmax(logits)
-                const float* logits_bt = logits + sequence*sequenceLength*paddedVocabSize + currentToken*paddedVocabSize;
-                float* probs_bt = probs + sequence*sequenceLength*paddedVocabSize + currentToken*paddedVocabSize;
+                const float* logits_bt = logits + sequence*maxSequenceLength*paddedVocabSize + currentToken*paddedVocabSize;
+                float* probs_bt = probs + sequence*maxSequenceLength*paddedVocabSize + currentToken*paddedVocabSize;
 
                 // maxval is only calculated and subtracted for numerical stability
                 float maxval = -10000.0f; // TODO something better
@@ -944,7 +1164,7 @@ void crossentropy_forward(
     const float* probs,
     const int* targets,
     const int batchSize,
-    const int sequenceLength,
+    const int maxSequenceLength,
     const int paddedVocabSize,
     const enum Mode mode,
     const int currentToken
@@ -957,19 +1177,22 @@ void crossentropy_forward(
     	switch (mode) {
      		case TRAIN_VAL: {
 
-       			for (int token = 0; token < sequenceLength; token++) {
+       			for (int token = 0; token < maxSequenceLength; token++) {
 	            	// loss = -log(probs[target])
-		            const float* probs_bt = probs + sequence*sequenceLength*paddedVocabSize + token*paddedVocabSize;
-		            const int targetToken = targets[sequence*sequenceLength + token];
-		            losses[sequence*sequenceLength + token] = -logf(probs_bt[targetToken]);
+		            const float* probs_bt = probs + sequence*maxSequenceLength*paddedVocabSize + token*paddedVocabSize;
+		            const int targetToken = targets[sequence*maxSequenceLength + token];
+		            losses[sequence*maxSequenceLength + token] = -logf(probs_bt[targetToken]);
           		}
           		break;
        		}
+         	case PREFILL: {
+          		break;
+          	}
        		case INFERENCE: { // only process currentToken
 	            // loss = -log(probs[target])
-		        const float* probs_bt = probs + sequence*sequenceLength*paddedVocabSize + currentToken*paddedVocabSize;
-		        const int targetToken = targets[sequence*sequenceLength + currentToken];
-		        losses[sequence*sequenceLength + currentToken] = -logf(probs_bt[targetToken]);
+		        const float* probs_bt = probs + sequence*maxSequenceLength*paddedVocabSize + currentToken*paddedVocabSize;
+		        const int targetToken = targets[sequence*maxSequenceLength + currentToken];
+		        losses[sequence*maxSequenceLength + currentToken] = -logf(probs_bt[targetToken]);
 				break;
          	}
      	}
@@ -1238,7 +1461,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
-
+/*
 typedef struct {
     float left;
     float right;
@@ -1293,13 +1516,14 @@ Pair compare_implementations(
     free(gpuLosses);
 
     return (Pair){.left = cpuLoss, .right = gpuLoss};
-}
+}*/
 
 void gpt2_forward(GPT2* model,
 	const int* inputs,
-	int* targets, // targets are optional and could be NULL
-	const size_t batchSize,
-	const size_t sequenceLength,
+	const int* targets, // targets are optional and could be NULL
+	const int batchSize,
+	const int contextLength,
+	const int maxSequenceLength,
 	const enum Mode mode,
 	const size_t currentToken
 ) {
@@ -1317,11 +1541,39 @@ void gpt2_forward(GPT2* model,
     size_t dimensions = model->config.channels;
 
     // validate inputs, all indices must be in the range [0, vocabSize)
-    #pragma omp parallel for
-    for (int i = 0; i < batchSize * sequenceLength; i++) {
-        assert(0 <= inputs[i] && inputs[i] < vocabSize);
-        if (targets != NULL) {
-            assert(0 <= targets[i] && targets[i] < vocabSize);
+    switch (mode) {
+    	case TRAIN_VAL: {
+     		for (int i = 0; i < batchSize * maxSequenceLength; i++) {
+             	assert(0 <= inputs[i] && inputs[i] < vocabSize);
+              	if (targets != NULL) {
+                 	assert(0 <= targets[i] && targets[i] < vocabSize);
+               	}
+        	}
+       		break;
+     	}
+      	case PREFILL: {
+     		for (int sequence = 0; sequence < batchSize; sequence++) {
+          		for (int token = 0; token < contextLength; token++) {
+         			const int i = sequence*maxSequenceLength + token;
+         			assert(0 <= inputs[i] && inputs[i] < vocabSize);
+                    if (targets != NULL) {
+                       	assert(0 <= targets[i] && targets[i] < vocabSize);
+                    }
+          		}
+            }
+            break;
+       	}
+        case INFERENCE: {
+        	for (int sequence = 0; sequence < batchSize; sequence++) {
+         		for (int token = 0; token < currentToken; token++) {
+           			const int i = sequence*maxSequenceLength + token;
+           			assert(0 <= inputs[i] && inputs[i] < vocabSize);
+                    if (targets != NULL) {
+                       	assert(0 <= targets[i] && targets[i] < vocabSize);
+                    }
+           		}
+            }
+        	break;
         }
     }
 
@@ -1329,9 +1581,9 @@ void gpt2_forward(GPT2* model,
     if (model->acts_memory == NULL) {
         // record the current B,T as well
         model->batch_size = batchSize;
-        model->seq_len = sequenceLength;
+        model->seq_len = maxSequenceLength;
         // and now allocate the space
-        fill_in_activation_sizes(model->act_sizes, model->config, batchSize, sequenceLength);
+        fill_in_activation_sizes(model->act_sizes, model->config, batchSize, maxSequenceLength);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
@@ -1340,21 +1592,21 @@ void gpt2_forward(GPT2* model,
         model->num_activations = num_activations;
         model->acts_memory = malloc_and_point_activations(model, &model->acts, model->act_sizes);
         // also create memory for caching inputs and targets
-        model->inputs = (int*)mallocCheck(batchSize * sequenceLength * sizeof(int));
-        model->targets = (int*)mallocCheck(batchSize * sequenceLength * sizeof(int)); // might be unused if we never have targets but it's small
+        model->inputs = (int*)mallocCheck(batchSize * maxSequenceLength * sizeof(int));
+        model->targets = (int*)mallocCheck(batchSize * maxSequenceLength * sizeof(int)); // might be unused if we never have targets but it's small
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
-        if (batchSize != model->batch_size || sequenceLength != model->seq_len) {
-            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, (int)batchSize, (int)sequenceLength);
+        if (batchSize != model->batch_size || maxSequenceLength != model->seq_len) {
+            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, (int)batchSize, (int)maxSequenceLength);
             exit(EXIT_FAILURE);
         }
     }
 
     // cache the inputs/targets
-    memcpy(model->inputs, inputs, batchSize * sequenceLength * sizeof(int));
+    memcpy(model->inputs, inputs, batchSize*contextLength*sizeof(int));
     if (targets != NULL) {
-        memcpy(model->targets, targets, batchSize * sequenceLength * sizeof(int));
+        memcpy(model->targets, targets, batchSize*(maxSequenceLength - contextLength)*sizeof(int));
     }
 
     // forward pass
@@ -1384,10 +1636,10 @@ void gpt2_forward(GPT2* model,
     */
 
 
-    encoder_forward(acts.encoded, inputs, params.wte, params.wpe, batchSize, sequenceLength, dimensions, mode, currentToken); // encoding goes into residual[0]
+    encoder_forward(acts.encoded, inputs, params.wte, params.wpe, batchSize, contextLength, maxSequenceLength, dimensions, mode, currentToken); // encoding goes into residual[0]
 
     for (int l = 0; l < numLayers; l++) {
-        residual = (l == 0 ? acts.encoded : acts.residual3 + (l-1) * batchSize * sequenceLength * dimensions);
+        residual = (l == 0 ? acts.encoded : acts.residual3 + (l-1) * batchSize * maxSequenceLength * dimensions);
 
         // get the pointers of the weights for this layer
         float* l_ln1w = params.ln1w + l * dimensions;
@@ -1404,70 +1656,74 @@ void gpt2_forward(GPT2* model,
         float* l_fcprojb = params.fcprojb + l * dimensions;
 
         // get the pointers of the activations for this layer
-        float* l_ln1 = acts.ln1 + l * batchSize * sequenceLength * dimensions;
-        float* l_ln1_mean = acts.ln1_mean + l * batchSize * sequenceLength;
-        float* l_ln1_rstd = acts.ln1_rstd + l * batchSize * sequenceLength;
-        float* l_qkv = acts.qkv + l * batchSize * sequenceLength * 3*dimensions;
-        float* l_atty = acts.atty + l * batchSize * sequenceLength * dimensions;
-        float* l_preatt = acts.preatt + l * batchSize * numHeads * sequenceLength * sequenceLength;
-        float* l_att = acts.att + l * batchSize * numHeads * sequenceLength * sequenceLength;
-        float* l_attproj = acts.attproj + l * batchSize * sequenceLength * dimensions;
-        float* l_residual2 = acts.residual2 + l * batchSize * sequenceLength * dimensions;
-        float* l_ln2 = acts.ln2 + l * batchSize * sequenceLength * dimensions;
-        float* l_ln2_mean = acts.ln2_mean + l * batchSize * sequenceLength;
-        float* l_ln2_rstd = acts.ln2_rstd + l * batchSize * sequenceLength;
-        float* l_fch = acts.fch + l * batchSize * sequenceLength * 4*dimensions;
-        float* l_fch_gelu = acts.fch_gelu + l * batchSize * sequenceLength * 4*dimensions;
-        float* l_fcproj = acts.fcproj + l * batchSize * sequenceLength * dimensions;
-        float* l_residual3 = acts.residual3 + l * batchSize * sequenceLength * dimensions;
+        float* l_ln1 = acts.ln1 + l * batchSize * maxSequenceLength * dimensions;
+        float* l_ln1_mean = acts.ln1_mean + l * batchSize * maxSequenceLength;
+        float* l_ln1_rstd = acts.ln1_rstd + l * batchSize * maxSequenceLength;
+        float* l_qkv = acts.qkv + l * batchSize * maxSequenceLength * 3*dimensions;
+        float* l_atty = acts.atty + l * batchSize * maxSequenceLength * dimensions;
+        float* l_preatt = acts.preatt + l * batchSize * numHeads * maxSequenceLength * maxSequenceLength;
+        float* l_att = acts.att + l * batchSize * numHeads * maxSequenceLength * maxSequenceLength;
+        float* l_attproj = acts.attproj + l * batchSize * maxSequenceLength * dimensions;
+        float* l_residual2 = acts.residual2 + l * batchSize * maxSequenceLength * dimensions;
+        float* l_ln2 = acts.ln2 + l * batchSize * maxSequenceLength * dimensions;
+        float* l_ln2_mean = acts.ln2_mean + l * batchSize * maxSequenceLength;
+        float* l_ln2_rstd = acts.ln2_rstd + l * batchSize * maxSequenceLength;
+        float* l_fch = acts.fch + l * batchSize * maxSequenceLength * 4*dimensions;
+        float* l_fch_gelu = acts.fch_gelu + l * batchSize * maxSequenceLength * 4*dimensions;
+        float* l_fcproj = acts.fcproj + l * batchSize * maxSequenceLength * dimensions;
+        float* l_residual3 = acts.residual3 + l * batchSize * maxSequenceLength * dimensions;
 
         // now do the forward pass
         // matmul_forward is just a linear layer in the architecture diagram
-        layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd , residual, l_ln1w, l_ln1b, batchSize, sequenceLength, dimensions, mode, currentToken);
+        layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd , residual, l_ln1w, l_ln1b, batchSize, contextLength, maxSequenceLength, dimensions, mode, currentToken);
         // might need to do caching here, as this is where QKV calc? need cache for each layer
         if (mode == INFERENCE) {
+        	//if (currentToken) do some prefill
        		// query calculation: ordered (*Q*, K, V) in l_qkv, l_qkvw & l_qkvb
-        	cached_matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, batchSize, sequenceLength, dimensions, dimensions, mode, currentToken);
+        	cached_matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, batchSize, maxSequenceLength, dimensions, dimensions, mode, currentToken);
          	// need correct offset for key and value within l_qkv, l_qkvw & l_qkvb as QKV are all together
           	// key calculation: +dimensions as ordered (Q, *K*, V) in l_qkv, l_qkvw & l_qkvb
           	float* key = l_qkv + dimensions;
-           	cached_matmul_forward(key, l_ln1, l_qkvw + dimensions*dimensions, l_qkvb + dimensions, batchSize, sequenceLength, dimensions, dimensions, mode, currentToken);
+           	cached_matmul_forward(key, l_ln1, l_qkvw + dimensions*dimensions, l_qkvb + dimensions, batchSize, maxSequenceLength, dimensions, dimensions, mode, currentToken);
           	// value calculation: +dimensions*2 as ordered (Q, K, *V*) in l_qkv, l_qkvw & l_qkvb
           	float* value = l_qkv + dimensions*2;
-         	cached_matmul_forward(value, l_ln1, l_qkvw + dimensions*dimensions*2, l_qkvb + dimensions*2, batchSize, sequenceLength, dimensions, dimensions, mode, currentToken);
+         	cached_matmul_forward(value, l_ln1, l_qkvw + dimensions*dimensions*2, l_qkvb + dimensions*2, batchSize, maxSequenceLength, dimensions, dimensions, mode, currentToken);
         } else {
-       		matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, batchSize, sequenceLength, dimensions, 3*dimensions, mode, currentToken);
+       		matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, batchSize, contextLength, maxSequenceLength, dimensions, 3*dimensions, mode, currentToken);
         }
-        attention_forward(l_atty, l_preatt, l_att, l_qkv, batchSize, sequenceLength, dimensions, numHeads, mode, currentToken);
-        matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, batchSize, sequenceLength, dimensions, dimensions, mode, currentToken);
-        residual_forward(l_residual2, residual, l_attproj, batchSize, sequenceLength, dimensions, mode, currentToken);
-        layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, batchSize, sequenceLength, dimensions, mode, currentToken);
-        matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, batchSize, sequenceLength, dimensions, 4*dimensions, mode, currentToken);
-        gelu_forward(l_fch_gelu, l_fch, batchSize, sequenceLength, 4*dimensions, mode, currentToken);
-        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, batchSize, sequenceLength, 4*dimensions, dimensions, mode, currentToken);
-        residual_forward(l_residual3, l_residual2, l_fcproj, batchSize, sequenceLength, dimensions, mode, currentToken);
+        attention_forward(l_atty, l_preatt, l_att, l_qkv, batchSize, contextLength, maxSequenceLength, dimensions, numHeads, mode, currentToken);
+        matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, batchSize, contextLength, maxSequenceLength, dimensions, dimensions, mode, currentToken);
+        residual_forward(l_residual2, residual, l_attproj, batchSize, contextLength, maxSequenceLength, dimensions, mode, currentToken);
+        layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, batchSize, contextLength, maxSequenceLength, dimensions, mode, currentToken);
+        matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, batchSize, contextLength, maxSequenceLength, dimensions, 4*dimensions, mode, currentToken);
+        gelu_forward(l_fch_gelu, l_fch, batchSize, contextLength, maxSequenceLength, 4*dimensions, mode, currentToken);
+        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, batchSize, contextLength, maxSequenceLength, 4*dimensions, dimensions, mode, currentToken);
+        residual_forward(l_residual3, l_residual2, l_fcproj, batchSize, contextLength, maxSequenceLength, dimensions, mode, currentToken);
     }
-    residual = (acts.residual3 + (numLayers - 1)*batchSize*sequenceLength*dimensions); // last residual is in residual3
-    layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, batchSize, sequenceLength, dimensions, mode, currentToken);
-    matmul_forward(acts.logits, acts.lnf, params.wte, NULL, batchSize, sequenceLength, dimensions, paddedVocabSize, mode, currentToken);
-    softmax_forward(acts.probs, acts.logits, batchSize, sequenceLength, vocabSize, paddedVocabSize, mode, currentToken);
+    residual = (acts.residual3 + (numLayers - 1)*batchSize*maxSequenceLength*dimensions); // last residual is in residual3
+    layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, batchSize, contextLength, maxSequenceLength, dimensions, mode, currentToken);
+    matmul_forward(acts.logits, acts.lnf, params.wte, NULL, batchSize, contextLength, maxSequenceLength, dimensions, paddedVocabSize, mode, currentToken);
+    softmax_forward(acts.probs, acts.logits, batchSize, contextLength, maxSequenceLength, vocabSize, paddedVocabSize, mode, currentToken);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
-        crossentropy_forward(model->acts.losses, model->acts.probs, targets, batchSize, sequenceLength, paddedVocabSize, mode, currentToken);
+        crossentropy_forward(model->acts.losses, model->acts.probs, targets, batchSize, maxSequenceLength, paddedVocabSize, mode, currentToken);
         // for convenience also evaluate the mean loss
         float mean_loss = 0.0f;
         switch (mode) {
         	case TRAIN_VAL: {
-         		for (int i = 0; i < batchSize*sequenceLength; i++) {
+         		for (int i = 0; i < batchSize*maxSequenceLength; i++) {
                 	mean_loss += model->acts.losses[i];
                 }
-           		mean_loss /= batchSize*sequenceLength;
+           		mean_loss /= batchSize*maxSequenceLength;
          		break;
          	}
+          	case PREFILL: {
+           		break;
+           	}
           	case INFERENCE: {
            		for (int sequence = 0; sequence < batchSize; sequence++) {
-               		const int index = sequence*sequenceLength + currentToken;
+               		const int index = sequence*maxSequenceLength + currentToken;
                   	mean_loss += model->acts.losses[index];
                 }
              	mean_loss /= batchSize;
@@ -1672,33 +1928,63 @@ void write_times(FILE* file, int numTokensGenerated, double totalTimeSeconds, do
 void inference(GPT2* model,
 	Tokenizer* tokenizer,
 	int* prompt,
+	const int* targets, // For eval
 	const int batchSize,
-	const int sequenceLength,
+	const int contextLength,
+	const int maxSequenceLength,
 	uint64_t* rng_state,
-	FILE* timesFile,
-    FILE* logitsFile
+	FILE* timesFile
 ) {
 	struct timespec start, end, ttft;
 	// now sample from the model autoregressively
 	printf("Generating:\n---\n");
 	clock_gettime(CLOCK_MONOTONIC, &start);
-	for (int currentToken = 0; currentToken < sequenceLength - 1; currentToken++) {
+	// prefill
+	gpt2_forward(model, prompt, NULL, batchSize, contextLength, maxSequenceLength, PREFILL, 0);
+	float* probs = model->acts.probs + (contextLength-1)*model->config.padded_vocab_size;
+	float coin = random_f32(rng_state);
+	int firstOutputToken = sample_mult(probs, model->config.vocab_size, coin);
+	clock_gettime(CLOCK_MONOTONIC, &ttft);
+	prompt[contextLength] = firstOutputToken;
+#define PRINT
+#ifdef PRINT
+	for (int word = 0; word < contextLength; ++word) {
+		if (tokenizer->init_ok) {
+		    const char* token_str = tokenizer_decode(tokenizer, prompt[word]);
+		    safe_printf(token_str);
+		} else {
+		    // fall back to printing the token id
+		    printf("%d ", prompt[word]);
+		}
+		fflush(stdout);
+	}
+	// print the generated token, either using the Tokenizer or a fallback
+	if (tokenizer->init_ok) {
+	    const char* token_str = tokenizer_decode(tokenizer, firstOutputToken);
+	    safe_printf(token_str);
+	} else {
+	    // fall back to printing the token id
+	    printf("%d ", firstOutputToken);
+	}
+	fflush(stdout);
+#endif
+	// decode
+	for (int currentToken = contextLength; currentToken < maxSequenceLength - 1; currentToken++) {
 		// this is where the key-value caching will come in
-		gpt2_forward(model, prompt, NULL, batchSize, sequenceLength, INFERENCE, currentToken);
+		gpt2_forward(model, prompt, targets, batchSize, contextLength, maxSequenceLength, INFERENCE, currentToken);
 		// furthermore, below we're only using b=0 (i.e. the first row) of all B rows
 		// we're in principle running B "inference streams" in parallel here
 		// but only using position 0
 		// get the Vp-dimensional vector probs[0, t, :]
-		float* probs = model->acts.probs + currentToken*model->config.padded_vocab_size;
-		float coin = random_f32(rng_state);
+		probs = model->acts.probs + currentToken*model->config.padded_vocab_size;
+		coin = random_f32(rng_state);
 		// note we're only sampling from the first V elements, ignoring padding
 		// (the probabilities in the padded region should be zero anyway)
 		int next_token = sample_mult(probs, model->config.vocab_size, coin);
-        if (currentToken == 0) {
-			clock_gettime(CLOCK_MONOTONIC, &ttft);
+		if (next_token == tokenizer->eot_token) {
+			break; // stop generation
 		}
 		prompt[currentToken+1] = next_token;
-#define PRINT
 #ifdef PRINT
 		// print the generated token, either using the Tokenizer or a fallback
 		if (tokenizer->init_ok) {
@@ -1714,8 +2000,8 @@ void inference(GPT2* model,
 	clock_gettime(CLOCK_MONOTONIC, &end);
 	double timeTakenSeconds = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 	double timeToFirstTokenMillis = 1e3 * ((ttft.tv_sec - start.tv_sec) + (ttft.tv_nsec - start.tv_nsec) / 1e9);
-	if (timesFile != NULL) write_times(timesFile, sequenceLength, timeTakenSeconds, timeToFirstTokenMillis);
-	if (logitsFile != NULL) {
+	if (timesFile != NULL) write_times(timesFile, maxSequenceLength-contextLength, timeTakenSeconds, timeToFirstTokenMillis);
+	/*if (logitsFile != NULL) {
         const size_t V = model->config.vocab_size;
         const size_t Vp = model->config.padded_vocab_size;
         for (int sequence = 0; sequence < batchSize; ++sequence) {
@@ -1728,11 +2014,11 @@ void inference(GPT2* model,
                 }
             }
         }
-    }
+    }*/
 #define DEBUG
 #ifdef DEBUG
-	printf("Time to first token: %lf ms\n", timeToFirstTokenMillis);
-	printf("\nTime to generate %i tokens: %lf s -> %lf tokens/s\n", sequenceLength, timeTakenSeconds, (double)sequenceLength/timeTakenSeconds);
+	printf("\nTime to first token: %lf ms\n", timeToFirstTokenMillis);
+	printf("Time to generate %i tokens: %lf s -> %lf tokens/s", maxSequenceLength-contextLength, timeTakenSeconds, (double)(maxSequenceLength-contextLength)/timeTakenSeconds);
 #endif
 	printf("\n---\n");
 }
@@ -1795,7 +2081,7 @@ void error_usage() {
 float gpt2_validate(GPT2* model, const int* inputs, int* targets, const size_t batchSize, const size_t sequenceLength) {
     assert(targets != NULL);
     // forward the model itself
-    gpt2_forward(model, inputs, targets, batchSize, sequenceLength, TRAIN_VAL, 0);
+    gpt2_forward(model, inputs, targets, batchSize, 0, sequenceLength, TRAIN_VAL, 0);
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
     const size_t vocabSize = model->config.vocab_size;
     // note: we don't need to generate dlogits here
@@ -1823,7 +2109,7 @@ int main(int argc, char* argv[]) {
     float skip_update_lossz = 0.0f; // skip update if loss goes above this in zscore
     float skip_update_gradz = 0.0f; // skip update if grad_norm goes above this in zscore
     int val_loss_every = 20; // every how many steps do we eval validation loss?
-    int val_max_steps = 20; // how many batches max do we eval for validation loss?
+    int val_max_steps = 3; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
     int numInferenceSteps = 1024; // number of steps of inference we will do / tokens will be generated
     int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
@@ -1897,7 +2183,6 @@ int main(int argc, char* argv[]) {
     }
 
     FILE* timeFile = fopenCheck(CPU_TIMES, "a");
-    FILE* logitsFile = fopenCheck(CPU_LOGITS, "wb");
 
     Logger logger;
     logger_init(&logger, output_log_dir, 0, resume);
@@ -1930,7 +2215,7 @@ int main(int argc, char* argv[]) {
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
-                gpt2_forward(&model, val_loader.inputs, val_loader.targets, batchSize, sequenceLength, TRAIN_VAL, 0);
+                gpt2_forward(&model, val_loader.inputs, val_loader.targets, batchSize, 0, sequenceLength, TRAIN_VAL, 0);
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
@@ -1939,11 +2224,13 @@ int main(int argc, char* argv[]) {
 
         // once in a while do model inference to print generated text
         // fill up prompt with the GPT2_EOT, which kicks off the generation
-		for (int i = 0; i < batchSize * sequenceLength; ++i) {
+/*
+        for (int i = 0; i < batchSize * sequenceLength; ++i) {
 			prompt[i] = tokenizer.eot_token;
 		}
 		memset(model.acts_memory, 0, model.num_activations * sizeof(float));
-        inference(&model, &tokenizer, prompt, batchSize, sequenceLength, &rng_state, timeFile, logitsFile);
+        inference(&model, &tokenizer, prompt, NULL, batchSize, 1, sequenceLength, &rng_state, timeFile);
+        */
         // do a training step
         /*
         clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1957,31 +2244,30 @@ int main(int argc, char* argv[]) {
         printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
         */
     }
-    fcloseCheck(logitsFile);
     // build an EvalLoader for HellaSwag
     EvalLoader eval_loader;
     const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
     const bool hellaswag_available = access(hellaswag_path, F_OK) == 0;
     const bool run_hellaswag = hellaswag_eval && hellaswag_available;
     if (run_hellaswag) {
-        FILE* cpuLogits = fopenCheck(CPU_LOGITS, "rb");
-        FILE* gpuLogits = fopenCheck(GPU_LOGITS, "rb");
+    	printf("| run hellaswag         | %-50s |\n", run_hellaswag ? "yes" : "no");
+        puts("+-----------------------+----------------------------------------------------+\n");
     	// no multi-GPU so can set index as 0 and total as 1
         evalloader_init(&eval_loader, hellaswag_path, 4, maxSequenceLength, 0, 1);
-        printf("| run hellaswag         | %-50s |\n", run_hellaswag ? "yes" : "no");
-        puts("+-----------------------+----------------------------------------------------+\n");
-	    float eval_acc_norm = 0.0f;
 	    evalloader_reset(&eval_loader);
-		evalloader_next_batch(&eval_loader);
-		int* correctTokens = (int*)malloc(sizeof(int)*eval_loader.T*eval_loader.B*4);
-        const int numberOfCompletions = evalloader_get_answers(correctTokens, &eval_loader, 1);
-        const int compareSequenceLength = sequenceLength - 1;
-        for (int sequence = 0; sequence < numberOfCompletions; ++sequence) {
-            int* currentTarget = correctTokens + sequence*eval_loader.T;
-            Pair results = compare_implementations(cpuLogits, gpuLogits, currentTarget, 1, compareSequenceLength, model.config.vocab_size, model.config.padded_vocab_size);
-            printf("CPU: %lf\n", results.left);
-            printf("GPU: %lf\n", results.right);
-        }
+		float cumulativeLoss = 0.f;
+		for (int i = 0; i < val_max_steps; ++i) {
+			evalloader_next_batch(&eval_loader);
+			// get the context/input/prompt from the loader
+			const int contextLength = eval_loader.contextLength;
+			memcpy(prompt, eval_loader.inputs, contextLength*sizeof(int));
+			// get the answers/correct tokens from the loader
+			const int* answer = evalloader_get_answer(&eval_loader);
+			assert(answer != NULL);
+			inference(&model, &tokenizer, prompt, answer, 1, contextLength, sequenceLength, &rng_state, NULL);
+			cumulativeLoss += model.mean_loss;
+		}
+		printf("\nCPU Cumulative loss = %lf\n", cumulativeLoss);
         /*
         printf("Num Batches: %i\n", eval_loader.num_batches);
 	    for (int i = 0; i < eval_loader.num_batches; i++) { // each batch has the 4 possible completion
@@ -1995,9 +2281,6 @@ int main(int argc, char* argv[]) {
 	        eval_acc_norm += (float)correct;
 	    }
 		*/
-		fcloseCheck(cpuLogits);
-        fcloseCheck(gpuLogits);
-        free(correctTokens);
 	    //printf("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
     }
     // free
