@@ -1926,8 +1926,6 @@ void inference(GPT2* model,
         }
         // get the V-dimensional vector probs[0, t-1, :]
         floatX* logits = model->acts.output + (token - 1) * model->config.padded_vocab_size;
-        const float dloss = 1.0f / (batchSize * maxSequenceLength); // results in the uniform average loss over all elements
-        if (targets != nullptr) fused_classifier(logits, model->acts.losses, dloss, targets, batchSize, maxSequenceLength, model->config.vocab_size, model->config.padded_vocab_size, False, main_stream);
         // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
         cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model->config.vocab_size*sizeof(float), cudaMemcpyDeviceToHost));
         cudaCheck(cudaDeviceSynchronize());
@@ -1954,7 +1952,9 @@ void inference(GPT2* model,
     clock_gettime(CLOCK_MONOTONIC, &end);
     double timeTakenSeconds = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 	double timeToFirstTokenMillis = 1e3 * ((ttft.tv_sec - start.tv_sec) + (ttft.tv_nsec - start.tv_nsec) / 1e9);
-	write_times(timesFile, maxSequenceLength, timeTakenSeconds, timeToFirstTokenMillis);
+    if (timesFile != NULL) {
+        write_times(timesFile, maxSequenceLength, timeTakenSeconds, timeToFirstTokenMillis);
+    }
 #define DEBUG
 #ifdef DEBUG
 	printf("Time to first token: %lf ms\n", timeToFirstTokenMillis);
@@ -2217,7 +2217,7 @@ int main(int argc, char* argv[]) {
                       warmup_iterations, train_num_batches, final_learning_rate_frac);
 
     // some memory for generating samples from the model
-    int* prompt = (int*)mallocCheck(batchSize * sequenceLength * sizeof(int));
+    int* prompt = (int*)mallocCheck(batchSize * maxSequenceLength * sizeof(int));
     float* cpu_logits_raw = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
     float*  cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
@@ -2283,27 +2283,6 @@ int main(int argc, char* argv[]) {
 
         // once in a while estimate HellaSwag accuracy (all processes collaborate)
         if (run_hellaswag) {
-            NvtxRange evaluation_range("HellaSwag evaluation");
-            printf("| run hellaswag         | %-50s |\n", run_hellaswag ? "yes" : "no");
-            puts("+-----------------------+----------------------------------------------------+\n");
-            // no multi-GPU so can set index as 0 and total as 1
-            evalloader_init(&eval_loader, hellaswag_path, 4, maxSequenceLength, 0, 1);
-            evalloader_reset(&eval_loader);
-            float cumulativeLoss = 0.f;
-            for (int i = 0; i < val_max_steps; ++i) {
-    			evalloader_next_batch(&eval_loader);
-    			// get the context/input/prompt from the loader
-    			const int contextLength = eval_loader.contextLength;
-    			memcpy(prompt, eval_loader.inputs, contextLength*sizeof(int));
-    			// get the answers/correct tokens from the loader
-    			const int* answer = evalloader_get_answer(&eval_loader);
-    			assert(answer != NULL);
-    			inference(&model, &tokenizer, prompt, answer, 1, contextLength, sequenceLength, &sample_rng_state, cpu_logits_raw, cpu_logits, NULL);
-    			cumulativeLoss += model.mean_loss;
-            }
-            printf("\nGPU Cumulative loss = %lf\n", cumulativeLoss);
-        }
-        /*if (run_hellaswag) {
             NvtxRange evaluation_range("evaluation");
             float eval_acc_norm = 0.0f;
             evalloader_reset(&eval_loader);
@@ -2319,7 +2298,7 @@ int main(int argc, char* argv[]) {
             printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
             logger_log_eval(&logger, step, eval_acc_norm / eval_loader.num_examples);
         }
-*/
+
         // once in a while do model inference to print generated text (only rank 0)
         if (false) {
             NvtxRange generation_range("generation");
