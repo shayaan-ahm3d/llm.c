@@ -277,8 +277,8 @@ typedef struct {
     int process_rank;
     int num_processes;
     // hyperparameters. use size_t to prevent overflow
-    size_t B; // (micro) batch size dimension of the tensor that feeds into the model
-    size_t T; // maximum context length of the model
+    size_t batch_size; // (micro) batch size dimension of the tensor that feeds into the model
+    size_t max_sequence_length; // maximum context length of the model
     // input handling and its state
     FILE* eval_file;
     uint16_t* buffer; // we fread data from file into this buffer
@@ -292,7 +292,7 @@ typedef struct {
     int* targets; // target tokens for the transformer
     char* mask; // mask=1 at all completion token locations
     int* label; // the correct completion labels
-    int num_completions; // number of completions for this example (4)
+    int num_completions; // number of possible answers for this example (4)
     int contextLength; // length of the context (prompt bit)
 } EvalLoader;
 
@@ -302,10 +302,10 @@ void evalloader_reset(EvalLoader *loader) {
     // then process 0 should start at 0, process 1 at N/4, process 2 at N/2, etc.
     // determine how much work there is for all processes
     int examples_per_process = CEIL_DIV(loader->num_examples, loader->num_processes);
-    int can_fit_examples = (int) (loader->B / ASSUMED_NUM_COMPLETIONS);
+    int can_fit_examples = (int) (loader->batch_size / ASSUMED_NUM_COMPLETIONS);
     if (can_fit_examples == 0) {
         // this could be fixed in the future, but for now keeping it simple and throw error when B too low
-        printf("HellaSwag EvalLoader: batch size %zu is < %d\n", loader->B, ASSUMED_NUM_COMPLETIONS);
+        printf("HellaSwag EvalLoader: batch size %zu is < %d\n", loader->batch_size, ASSUMED_NUM_COMPLETIONS);
         printf("---> HINT: Disable HellaSwag eval with -h 0, or increase batch size with -b\n");
         exit(EXIT_FAILURE);
     }
@@ -340,14 +340,15 @@ void evalloader_reset(EvalLoader *loader) {
 
 void evalloader_init(EvalLoader *loader,
                      const char* filename,
-                     size_t B,
-                     size_t T,
+                     size_t batchSize,
+                     size_t sequenceLength,
                      int process_rank,
-                     int num_processes) {
+                     int num_processes
+) {
     loader->process_rank = process_rank;
     loader->num_processes = num_processes;
-    loader->B = B;
-    loader->T = T;
+    loader->batch_size = batchSize;
+    loader->max_sequence_length = sequenceLength;
 
     // open the file and validate the header
     loader->eval_file = fopenCheck(filename, "rb");
@@ -364,14 +365,14 @@ void evalloader_init(EvalLoader *loader,
     // up to T tokens, and their tokens are uint16_t (so 2 bytes/token).
     // There's a few more things in each example but they are minor.
     // So longest example should be roughly this. Just trying to make sure it's sensible.
-    assert(longest_example_bytes > 0 && longest_example_bytes < (1+ASSUMED_NUM_COMPLETIONS)*T*2);
+    assert(longest_example_bytes > 0 && longest_example_bytes < (1+ASSUMED_NUM_COMPLETIONS)*sequenceLength*2);
 
     // allocate all the space we'll need
-    int can_fit_examples = (int) (B / ASSUMED_NUM_COMPLETIONS);
+    int can_fit_examples = (int) (batchSize / ASSUMED_NUM_COMPLETIONS);
     loader->buffer = (uint16_t*)mallocCheck(longest_example_bytes);
-    loader->inputs = (int*)calloc(B * T, sizeof(int));
-    loader->targets = (int*)calloc(B * T, sizeof(int));
-    loader->mask = (char*)mallocCheck(B * T * sizeof(char));
+    loader->inputs = (int*)calloc(batchSize * sequenceLength, sizeof(int));
+    loader->targets = (int*)calloc(batchSize * sequenceLength, sizeof(int));
+    loader->mask = (char*)mallocCheck(batchSize * sequenceLength * sizeof(char));
     loader->label = (int*)mallocCheck(can_fit_examples * sizeof(int));
 
     // reset the loader, to initialize it
@@ -383,8 +384,8 @@ void evalloader_next_example_(EvalLoader *loader, int example_batch_index) {
     // because every (B,T) tensor can fit multiple examples and we want to take advantage,
     // we also pass in the example_batch_index to indicate which example in the batch we are loading
     // and each example takes up ASSUMED_NUM_COMPLETIONS rows in the batch
-    size_t B = loader->B;
-    size_t T = loader->T;
+    size_t batchSize = loader->batch_size;
+    size_t sequenceLength = loader->max_sequence_length;
     int batch_dim_offset = example_batch_index * ASSUMED_NUM_COMPLETIONS;
     // read the current example header
     uint16_t example_header[3];
@@ -400,26 +401,26 @@ void evalloader_next_example_(EvalLoader *loader, int example_batch_index) {
     freadCheck(loader->buffer, sizeof(char), example_bytes, loader->eval_file);
     // process the example label
     int label = (int)loader->buffer[0];
-    int can_fit_examples = (int) (loader->B / ASSUMED_NUM_COMPLETIONS);
+    int can_fit_examples = (int) (loader->batch_size / ASSUMED_NUM_COMPLETIONS);
     assert(label >= 0 && label < ASSUMED_NUM_COMPLETIONS); // we expect the label to be in [0, 4) for right now
     assert(example_batch_index >= 0 && example_batch_index < can_fit_examples);
     loader->label[example_batch_index] = label; // store for output
     // process the number of completions
     int num_completions = (int)loader->buffer[1];
     assert(num_completions == ASSUMED_NUM_COMPLETIONS); // we expect 4 completions for now
-    assert(batch_dim_offset + num_completions <= B); // we expect to fit in the batch
+    assert(batch_dim_offset + num_completions <= batchSize); // we expect to fit in the batch
     loader->num_completions = num_completions; // store for output
     // process the context
     // the context is shared for all completions, so we insert it into all data rows equally
     int context_length = (int)loader->buffer[2];
     loader->contextLength = context_length; // so I can use from the main file
     uint16_t *context_tokens_start = &loader->buffer[3]; // where the tokens start
-    assert(context_length > 0 && context_length < T); // context is non-empty and up to T
+    assert(context_length > 0 && context_length < sequenceLength); // context is non-empty and up to T
     for (int b = 0; b < num_completions; b++) {
         for (int i = 0; i < context_length; i++) {
             int boff = batch_dim_offset + b;
             int tok_cur = (int)context_tokens_start[i];
-            loader->inputs[boff * T + i] = tok_cur;
+            loader->inputs[boff * sequenceLength + i] = tok_cur;
         }
     }
     // process the completions, insert them in their row, right after the (shared) context
@@ -428,19 +429,19 @@ void evalloader_next_example_(EvalLoader *loader, int example_batch_index) {
         int coff = batch_dim_offset + c;
         int completion_length = (int)completions_iter[0];
         uint16_t *completion_tokens_start = completions_iter + 1;
-        assert(completion_length > 0 && context_length + completion_length < T); // things fit?
+        assert(completion_length > 0 && context_length + completion_length < sequenceLength); // things fit?
         for (int i = 0; i < completion_length; i++) {
             int tok_cur = (int)completion_tokens_start[i];
             // at inputs, the completions simply follow the context
-            loader->inputs[coff * T + context_length + i] = tok_cur;
+            loader->inputs[coff * sequenceLength + context_length + i] = tok_cur;
             // at targets things start to get tricky
             // we expect the last context token to predict the first completion token
             // and then onwards from there.
-            loader->targets[coff * T + context_length + i - 1] = tok_cur;
+            loader->targets[coff * sequenceLength + context_length + i - 1] = tok_cur;
             // and at these positions, we want to set mask=1, because these are the
             // positions where we want to average the loss, in each row, to determine
             // its overall probability of following the context.
-            loader->mask[coff * T + context_length + i - 1] = 1;
+            loader->mask[coff * sequenceLength + context_length + i - 1] = 1;
         }
         completions_iter += 1 + completion_length; // move to the next completion
     }
@@ -449,8 +450,8 @@ void evalloader_next_example_(EvalLoader *loader, int example_batch_index) {
 }
 
 void evalloader_next_batch(EvalLoader *loader) {
-    size_t B = loader->B;
-    size_t T = loader->T;
+    size_t B = loader->batch_size;
+    size_t T = loader->max_sequence_length;
     // init mask to zeros, no need to do it for inputs & targets, the values where the mask
     // is set will be correctly overwritten every time.
     memset(loader->mask, 0, B * T * sizeof(char));
@@ -471,25 +472,25 @@ void evalloader_next_batch(EvalLoader *loader) {
 // Could make more effient and not copy later.
 static void evalloader_get_prompts(const EvalLoader* loader, int* prompt) {
     const int b = 0;
-    for (int token = 0; token < loader->T; ++token) {
+    for (int token = 0; token < loader->max_sequence_length; ++token) {
         // mask 0 means it's the prompt bit
-        if (loader->mask[b*loader->T + token] == 0) {
-            prompt[token] = loader->inputs[b*loader->T + token];
+        if (loader->mask[b*loader->max_sequence_length + token] == 0) {
+            prompt[token] = loader->inputs[b*loader->max_sequence_length + token];
         }
     }
 }
 
 int* evalloader_get_answer(const EvalLoader* loader) {
     // Calculate how many examples are currently in the batch
-    const int can_fit_examples = loader->B / ASSUMED_NUM_COMPLETIONS;
+    const int can_fit_examples = loader->batch_size / ASSUMED_NUM_COMPLETIONS;
     //should just be 1
     for (int i = 0; i < can_fit_examples; ++i) {
         int correctLabel = loader->label[i];
         int rowIndex = i*ASSUMED_NUM_COMPLETIONS + correctLabel;
-        for (int t = 0; t < loader->T; t++) {
+        for (int t = 0; t < loader->max_sequence_length; t++) {
             // The mask is 1 only at the positions of the completion tokens
-            if (loader->mask[rowIndex*loader->T + t] == 1) {
-                return loader->targets + rowIndex*loader->T;
+            if (loader->mask[rowIndex*loader->max_sequence_length + t] == 1) {
+                return loader->targets + rowIndex*loader->max_sequence_length;
             }
         }
     }
@@ -503,8 +504,8 @@ int evalloader_stat_losses(EvalLoader *loader, float* losses) {
     // with how we construct and represent the data batches.
     // returns the number of correct examples in this batch.
     int correct = 0;
-    size_t B = loader->B;
-    size_t T = loader->T;
+    size_t B = loader->batch_size;
+    size_t T = loader->max_sequence_length;
     // iterate the examples in this batch
     int can_fit_examples = (int) (B / ASSUMED_NUM_COMPLETIONS);
     for (int i = 0; i < can_fit_examples; i++) {

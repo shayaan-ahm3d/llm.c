@@ -1,6 +1,8 @@
 /*
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
+#include <blis/blis.h>
+#include <cstddef>
 #include <type_traits>
 #include <unistd.h>
 #include <stdio.h>
@@ -316,7 +318,7 @@ void* malloc_and_point_activations(GPT2* model, TensorSpec (&tensors)[NUM_ACTIVA
         // extra protection so we don't accidentally use an empty buffer
         if(tensors[i].size == 0) {
             *(tensors[i].ptr) = NULL;
-        }else {
+        } else {
             *(tensors[i].ptr) = acts_memory_iterator;
             acts_memory_iterator += tensors[i].size * sizeof_dtype(tensors[i].type);
         }
@@ -1836,6 +1838,8 @@ void error_usage() {
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
     fprintf(stderr, "  -h <int>    hellaswag eval run? (default = 0)\n");
+    fprintf(stderr, "  -H <string> hellaswag data file path (default = dev/data/hellaswag/hellaswag_val.bin)\n");
+    fprintf(stderr, "  -K <string> per-example loss CSV output path (default = none)\n");
     // debugging
     fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
     // numerics
@@ -1870,16 +1874,17 @@ void inference(GPT2* model,
 	uint64_t* rng_state,
     float* cpu_logits_raw,
     float* cpu_logits,
-	FILE* timesFile
+	FILE* timesFile,
+    bool print = true
 ) {
     struct timespec start, end, ttft;
     NvtxRange generation_range("Inference prefill");
-    printf("Generating:\n---\n");
+    if (print) { printf("Generating:\n---\n"); }
     clock_gettime(CLOCK_MONOTONIC, &start);
     // prefill
     gpt2_forward_prefill(model, prompt, batchSize, contextLength, maxSequenceLength);
     floatX* firstTokenLogits = model->acts.output + (contextLength - 1)*model->config.padded_vocab_size;
-   // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
+    // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
     cudaCheck(cudaMemcpy(cpu_logits_raw, firstTokenLogits, model->config.vocab_size*sizeof(float), cudaMemcpyDeviceToHost));
     cudaCheck(cudaDeviceSynchronize());
     // convert to FP32 into cpu_logits (this does nothing useful if float == float)
@@ -1891,63 +1896,54 @@ void inference(GPT2* model,
     int firstOutputToken = sample_softmax(cpu_logits, model->config.vocab_size, coin);
     clock_gettime(CLOCK_MONOTONIC, &ttft);
     prompt[contextLength] = firstOutputToken;
-#define PRINT
-#ifdef PRINT
-    // print the generated token, either using the Tokenizer or a fallback
-    if (tokenizer->init_ok) {
-        const char* token_str = tokenizer_decode(tokenizer, firstOutputToken);
-        safe_printf(token_str);
-    } else {
-        // fall back to printing the token id
-        printf("%d ", firstOutputToken);
+    if (print) {
+        if (tokenizer->init_ok) {
+            safe_printf(tokenizer_decode(tokenizer, firstOutputToken));
+        } else {
+            printf("%d ", firstOutputToken);
+        }
+        fflush(stdout);
     }
-    fflush(stdout);
-#endif
-    // decode
-    for (size_t token = contextLength; token < maxSequenceLength; token++) {
+    // decode: process token at position t, read logit at t, write next token to t+1
+    for (size_t token = contextLength; token < maxSequenceLength - 1; token++) {
         NvtxRange generation_range("Inference decode, step", token);
-        // we try not to be too wasteful for inference by not calculating all of B,T
-        // Using a smaller B is always bit-for-bit identical, but T is more tricky
-        // for non-CUDNN, we need to make sure the attention buffer is memset to 0
-        // for cuDNN, it might suddenly decide to use a slightly different algorithm...
-        // on cuDNN 9.2.1 with cuDNN FrontEnd 1.5.2, T >= 256 seems bit-for-bit identical
-        // (but even if it wasn't fully identical that's probably not the end of the world)
-        // with B=1 in non-cuDNN mode we use token-by-token decode with a KV cache.
-
 #ifndef ENABLE_CUDNN
         if (batchSize == 1) {
-            // Decode exactly one position and reuse cached K/V from previous steps
             gpt2_forward_inference(model, prompt, targets, batchSize, contextLength, maxSequenceLength, INFERENCE, token);
         } else
 #endif
         {
-            // Fallback path for unsupported decode modes
             gpt2_forward(model, prompt, 1, CEIL_DIV(token, std::min(maxSequenceLength,(size_t)256)) * std::min(maxSequenceLength,(size_t)256));
         }
-        // get the V-dimensional vector probs[0, t-1, :]
-        floatX* logits = model->acts.output + (token - 1) * model->config.padded_vocab_size;
-        // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
+        // logit at position token predicts targets[token] (the next token)
+        floatX* logits = model->acts.output + token*model->config.padded_vocab_size;
         cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model->config.vocab_size*sizeof(float), cudaMemcpyDeviceToHost));
         cudaCheck(cudaDeviceSynchronize());
-        // convert to FP32 into cpu_logits (this does nothing useful if float == float)
         for (int i = 0; i < model->config.vocab_size; i++) {
             cpu_logits[i] = (float)cpu_logits_raw[i];
         }
-        // sample the next token
+        if (targets != NULL) {
+            float maxLogit = cpu_logits[0];
+            for (size_t j = 1; j < model->config.vocab_size; j++) {
+                if (cpu_logits[j] > maxLogit) maxLogit = cpu_logits[j];
+            }
+            float sumExp = 0.0f;
+            for (size_t j = 0; j < model->config.vocab_size; j++) {
+                sumExp += expf(cpu_logits[j] - maxLogit);
+            }
+            model->mean_loss = -(cpu_logits[targets[token]] - maxLogit - logf(sumExp));
+        }
         float coin = random_f32(rng_state);
         int next_token = sample_softmax(cpu_logits, model->config.vocab_size, coin);
-        prompt[token] = next_token;
-#ifdef PRINT
-        // print the generated token, either using the Tokenizer or a fallback
-        if (tokenizer->init_ok) {
-            const char* token_str = tokenizer_decode(tokenizer, next_token);
-            safe_printf(token_str);
-        } else {
-            // fall back to printing the token id
-            printf("%d ", next_token);
+        prompt[token + 1] = next_token; // set next position for next iteration
+        if (print) {
+            if (tokenizer->init_ok) {
+                safe_printf(tokenizer_decode(tokenizer, next_token));
+            } else {
+                printf("%d ", next_token);
+            }
+            fflush(stdout);
         }
-        fflush(stdout);
-#endif
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
     double timeTakenSeconds = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
@@ -1955,12 +1951,52 @@ void inference(GPT2* model,
     if (timesFile != NULL) {
         write_times(timesFile, maxSequenceLength, timeTakenSeconds, timeToFirstTokenMillis);
     }
-#define DEBUG
-#ifdef DEBUG
-	printf("Time to first token: %lf ms\n", timeToFirstTokenMillis);
-	printf("\nTime to generate %zu tokens: %lf s -> %lf tokens/s\n", (size_t)maxSequenceLength, timeTakenSeconds, (double)maxSequenceLength/timeTakenSeconds);
-#endif
-	printf("\n---\n");
+    if (print) {
+        printf("\nTime to first token: %lf ms\n", timeToFirstTokenMillis);
+        printf("\nTime to generate %zu tokens: %lf s -> %lf tokens/s\n", maxSequenceLength-contextLength, timeTakenSeconds, (double)(maxSequenceLength-contextLength)/timeTakenSeconds);
+        printf("\n---\n");
+    }
+}
+
+float evaluate(EvalLoader* eval_loader,
+    GPT2* model,
+    Tokenizer* tokenizer,
+    const size_t maxSequenceLength,
+    uint64_t* sample_rng_state,
+    const int numberOfExamplesToTest, // actually batches, but since 4/4=1 it's only number of examples
+    int* prompt,
+    float* cpu_logits_raw,
+    float* cpu_logits,
+    const char* gpu_losses_csv_path,
+    FILE* timeFile
+) {
+    assert(eval_loader != NULL && model != NULL && tokenizer != NULL && gpu_losses_csv_path != NULL);
+    NvtxRange evaluation_range("evaluation");
+    // reset before using
+    evalloader_reset(eval_loader);
+
+    FILE* fp = fopenCheck(gpu_losses_csv_path, "w");
+    fprintf(fp, "exampleIndex,contextLength,loss\n");
+
+    float cumulativeLoss = 0.0f;
+    for (int i = 0; i < numberOfExamplesToTest; ++i) {
+        // must load in next batch before using
+        evalloader_next_batch(eval_loader);
+        // copy the HellaSwag inputs into the model prompt
+        memcpy(prompt, eval_loader->inputs, eval_loader->contextLength * sizeof(int));
+        // get the correct completion from HellaSwag
+        const int* answer = evalloader_get_answer(eval_loader);
+        assert(answer != NULL);
+        // reset model before each inference pass
+        cudaCheck(cudaMemset(model->acts_memory, 0, model->acts_memory_bytes));
+        // run inference using the context and compute loss against the targets (correct HellaSwag completion)
+        inference(model, tokenizer, prompt, answer, 1, eval_loader->contextLength, maxSequenceLength, sample_rng_state, cpu_logits_raw, cpu_logits, timeFile, true);
+        cumulativeLoss += model->mean_loss;
+
+        fprintf(fp, "%d,%d,%f\n", eval_loader->current_example_index, eval_loader->contextLength, model->mean_loss);
+    }
+    fcloseCheck(fp);
+    return cumulativeLoss;
 }
 
 // ----------------------------------------------------------------------------
@@ -1969,7 +2005,7 @@ int main(int argc, char* argv[]) {
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
-    const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
+    const char* load_filename = "gpt2_124M.bin"; // don't use bf16 version
     const char* lr_scheduler_type = "cosine";
     const char* output_log_dir = NULL;
     int checkpoint_every = 0; // write checkpoints every how many steps?
@@ -1979,7 +2015,7 @@ int main(int argc, char* argv[]) {
     int batchSize = 4; // batch size
     int maxSequenceLength = 1024; // sequence length max
     int total_batch_size = -1; // will be calculated down below later, if not provided
-    float learning_rate = 3e-4f;
+    float learning_rate = 0.f;
     int log_gpu_every = -1;
     int warmup_iterations = 0;
     float final_learning_rate_frac = 1.0f; // final fraction of learning rate, at end of training
@@ -1987,17 +2023,19 @@ int main(int argc, char* argv[]) {
     float skip_update_lossz = 0.0f; // skip update if loss goes above this in zscore
     float skip_update_gradz = 0.0f; // skip update if grad_norm goes above this in zscore
     int val_loss_every = 20; // every how many steps do we eval validation loss?
-    int val_max_steps = 20; // how many batches max do we eval for validation loss?
+    int val_max_steps = 1; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
     int sequenceLength = 64; // number of steps of inference we will do
     int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
-    int max_steps = -1;
+    int max_steps = 1;
     int override_enable_tf32 = 1;
     int use_master_weights = 1;
     int gelu_fusion = -1; // 0 = none, 1 = forward, 2 = forward+backward (-1 => per-GPU default)
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
-    int hellaswag_eval = 0;
+    int hellaswag_eval = 1;
+    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
+    const char* gpu_losses_csv_path = "gpu_eval_losses.csv";
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -2036,6 +2074,8 @@ int main(int argc, char* argv[]) {
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'H') { hellaswag_path = argv[i+1]; }
+        else if (argv[i][1] == 'K') { gpu_losses_csv_path = argv[i+1]; }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'f') { strcpy(fs_path, argv[i+1]); }
@@ -2174,11 +2214,10 @@ int main(int argc, char* argv[]) {
 
     // build an EvalLoader for HellaSwag
     EvalLoader eval_loader;
-    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
     const bool hellaswag_available = access(hellaswag_path, F_OK) == 0;
     const bool run_hellaswag = hellaswag_eval && hellaswag_available;
     if (run_hellaswag) {
-        evalloader_init(&eval_loader, hellaswag_path, batchSize, maxSequenceLength, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+        evalloader_init(&eval_loader, hellaswag_path, 4, maxSequenceLength, 0, 1);
     }
     printf0("| run hellaswag         | %-50s |\n", run_hellaswag ? "yes" : "no");
     printf0("+-----------------------+----------------------------------------------------+\n");
@@ -2219,7 +2258,7 @@ int main(int argc, char* argv[]) {
     // some memory for generating samples from the model
     int* prompt = (int*)mallocCheck(batchSize * maxSequenceLength * sizeof(int));
     float* cpu_logits_raw = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
-    float*  cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
+    float* cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
     // if we found a checkpoint to resume from, load the optimization state
     int step = 0;
@@ -2253,9 +2292,7 @@ int main(int argc, char* argv[]) {
 
     // train
     const char* GPU_TIMES = "gpu_times.csv";
-    const char* GPU_LOGITS = "gpu_logits.log";
     FILE* timeFile = fopenCheck(GPU_TIMES, "a");
-    FILE* logitsFile = fopenCheck(GPU_LOGITS, "wb");
     uint64_t sample_rng_state = 1337;
     cudaEvent_t start, end;
     cudaCheck(cudaEventCreate(&start));
@@ -2263,7 +2300,7 @@ int main(int argc, char* argv[]) {
     cudaCheck(cudaProfilerStart());
     double total_sum_iteration_time_s = 0.0;
     float ema_tokens_per_second = 0.0f;
-    for (; step <= train_num_batches; step++) {
+    for (; step < train_num_batches; step++) {
         NvtxRange step_range("Train step", step);
 
         // once in a while estimate the validation loss (all processes collaborate)
@@ -2281,22 +2318,20 @@ int main(int argc, char* argv[]) {
             logger_log_val(&logger, step, val_loss);
         }
 
-        // once in a while estimate HellaSwag accuracy (all processes collaborate)
+        // once in a while estimate HellaSwag loss via inference
         if (run_hellaswag) {
-            NvtxRange evaluation_range("evaluation");
-            float eval_acc_norm = 0.0f;
-            evalloader_reset(&eval_loader);
-            for (int i = 0; i < eval_loader.num_batches; i++) {
-                if (i % 10 == 0) { printf("evaluating HellaSwag: %d/%d\r", i, eval_loader.num_batches); }
-                evalloader_next_batch(&eval_loader);
-                gpt2_validate(&model, eval_loader.inputs, eval_loader.targets, batchSize, maxSequenceLength);
-                int correct = evalloader_stat_losses(&eval_loader, model.cpu_losses);
-                eval_acc_norm += (float)correct;
-            }
-            // careful because not all ranks may have the exact same allocation of number of examples
-            eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm, &multi_gpu_config);
-            printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
-            logger_log_eval(&logger, step, eval_acc_norm / eval_loader.num_examples);
+            const float cumulativeLoss = evaluate(&eval_loader,
+                &model,
+                &tokenizer,
+                maxSequenceLength,
+                &sample_rng_state,
+                val_max_steps,
+                prompt,
+                cpu_logits_raw,
+                cpu_logits,
+                gpu_losses_csv_path,
+                timeFile);
+            printf("\nGPU Cumulative Loss = %lf\n", cumulativeLoss);
         }
 
         // once in a while do model inference to print generated text (only rank 0)
@@ -2327,7 +2362,7 @@ int main(int argc, char* argv[]) {
             }
         }
         resuming = 0;
-
+        /*
         // bit confusing: we want to make sure to eval and sample on 0th iteration
         // but also after the very last iteration. so we loop for step <= train_num_batches
         // instead of just < train_num_batches (one extra due to <=), only to do
@@ -2384,10 +2419,10 @@ int main(int argc, char* argv[]) {
             bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
         float mfu = gpt2_estimate_mfu(&model, batchSize * maxSequenceLength * grad_accum_steps, time_elapsed_ms / 1000.0f);
-        /*printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
+        printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
                 step + 1, train_num_batches, model.mean_loss, zloss, grad_norm, zgrad, step_learning_rate,
                 time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
-        */
+
         if(log_gpu_every > 0 && (step + 1) % log_gpu_every == 0) {
             GPUUtilInfo gpu_info = get_gpu_utilization_info();
             printf0("                  compute %2.1f%% | memory: %2.1f%% | fan: %2d%% | %4d MHz / %4d MHz | %3d W / %3d W | %d°C / %d°C | %s\n",
@@ -2398,9 +2433,10 @@ int main(int argc, char* argv[]) {
 
         // disable the profiler after 3 steps of optimization
         if (step == 3) { cudaProfilerStop(); }
+        */
     }
     // add a total average, for optimizations that are only mild improvements (excluding 1st batch as warmup)
-    printf0("total average iteration time: %f ms\n", total_sum_iteration_time_s / (train_num_batches-1) * 1000);
+    //printf0("total average iteration time: %f ms\n", total_sum_iteration_time_s / (train_num_batches-1) * 1000);
 
     // free and destroy everything
     cudaCheck(cudaEventDestroy(end));
@@ -2416,7 +2452,6 @@ int main(int argc, char* argv[]) {
     gpt2_free(&model);
     common_free(model);
     fcloseCheck(timeFile);
-    fcloseCheck(logitsFile);
     return EXIT_SUCCESS;
 }
 #endif
