@@ -1,7 +1,6 @@
 /*
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
-#include <blis/blis.h>
 #include <cstddef>
 #include <type_traits>
 #include <unistd.h>
@@ -1061,12 +1060,9 @@ void gpt2_forward_inference(
     const size_t currentToken
 ) {
     NVTX_RANGE_FN();
-
-    // Keep a safe fallback path for unsupported cases
-    if (batchSize != 1 || currentToken >= maxSequenceLength || maxSequenceLength > (size_t)model->seq_len) {
-        gpt2_forward(model, inputs, batchSize, maxSequenceLength);
-        return;
-    }
+    assert(batchSize == 1);
+    assert(currentToken <= maxSequenceLength);
+    assert(maxSequenceLength >= (size_t)model->seq_len);
 
     const size_t vocabSize = model->config.vocab_size;
     const size_t paddedVocabSize = model->config.padded_vocab_size;
@@ -1859,11 +1855,6 @@ void error_usage() {
     exit(EXIT_FAILURE);
 }
 
-// Open file before this
-void write_times(FILE* file, int numTokensGenerated, double totalTimeSeconds, double timeToFirstTokenSeconds) {
-	fprintf(file, "%d,%lf,%lf\n", numTokensGenerated, totalTimeSeconds, timeToFirstTokenSeconds);
-}
-
 void inference(GPT2* model,
 	Tokenizer* tokenizer,
 	int* prompt,
@@ -1877,9 +1868,10 @@ void inference(GPT2* model,
 	FILE* timesFile,
     bool print = true
 ) {
+    assert(batchSize == 1);
     struct timespec start, end, ttft;
     NvtxRange generation_range("Inference prefill");
-    if (print) { printf("Generating:\n---\n"); }
+    printf("Generating:\n---\n");
     clock_gettime(CLOCK_MONOTONIC, &start);
     // prefill
     gpt2_forward_prefill(model, prompt, batchSize, contextLength, maxSequenceLength);
@@ -1887,7 +1879,7 @@ void inference(GPT2* model,
     // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
     cudaCheck(cudaMemcpy(cpu_logits_raw, firstTokenLogits, model->config.vocab_size*sizeof(float), cudaMemcpyDeviceToHost));
     cudaCheck(cudaDeviceSynchronize());
-    // convert to FP32 into cpu_logits (this does nothing useful if float == float)
+    // convert to FP32 into cpu_logits (this does nothing useful if floatX == float)
     for (int i = 0; i < model->config.vocab_size; i++) {
         cpu_logits[i] = (float)cpu_logits_raw[i];
     }
@@ -1897,6 +1889,17 @@ void inference(GPT2* model,
     clock_gettime(CLOCK_MONOTONIC, &ttft);
     prompt[contextLength] = firstOutputToken;
     if (print) {
+        // print context too
+        for (int word = 0; word < contextLength; ++word) {
+			if (tokenizer->init_ok) {
+			    const char* token_str = tokenizer_decode(tokenizer, prompt[word]);
+			    safe_printf(token_str);
+			} else {
+			    // fall back to printing the token id
+			    printf("%d ", prompt[word]);
+			}
+			fflush(stdout);
+		}
         if (tokenizer->init_ok) {
             safe_printf(tokenizer_decode(tokenizer, firstOutputToken));
         } else {
@@ -1905,24 +1908,34 @@ void inference(GPT2* model,
         fflush(stdout);
     }
     // decode: process token at position t, read logit at t, write next token to t+1
-    for (size_t token = contextLength; token < maxSequenceLength - 1; token++) {
-        NvtxRange generation_range("Inference decode, step", token);
-#ifndef ENABLE_CUDNN
-        if (batchSize == 1) {
-            gpt2_forward_inference(model, prompt, targets, batchSize, contextLength, maxSequenceLength, INFERENCE, token);
-        } else
-#endif
-        {
-            gpt2_forward(model, prompt, 1, CEIL_DIV(token, std::min(maxSequenceLength,(size_t)256)) * std::min(maxSequenceLength,(size_t)256));
-        }
+    size_t tokenIndex = contextLength; // keep outside for loop so can count number actually generated at the end
+    for (; tokenIndex < maxSequenceLength - 1; tokenIndex++) {
+        NvtxRange generation_range("Inference decode, step", tokenIndex);
+
+        gpt2_forward_inference(model, prompt, targets, batchSize, contextLength, maxSequenceLength, INFERENCE, tokenIndex);
         // logit at position token predicts targets[token] (the next token)
-        floatX* logits = model->acts.output + token*model->config.padded_vocab_size;
+        floatX* logits = model->acts.output + tokenIndex*model->config.padded_vocab_size;
+        if (targets != NULL) {
+            int targetToken = targets[tokenIndex];
+            cudaCheck(cudaMemcpy(model->targets, &targetToken, sizeof(int), cudaMemcpyHostToDevice));
+            fused_classifier(logits,
+                model->acts.losses,
+                1.0f,
+                model->targets,
+                1,
+                1,
+                (int)model->config.vocab_size,
+                (int)model->config.padded_vocab_size,
+                False,
+                main_stream);
+            cudaCheck(cudaMemcpyAsync(&model->mean_loss, model->acts.losses, sizeof(float), cudaMemcpyDeviceToHost, main_stream));
+        }
         cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model->config.vocab_size*sizeof(float), cudaMemcpyDeviceToHost));
         cudaCheck(cudaDeviceSynchronize());
         for (int i = 0; i < model->config.vocab_size; i++) {
             cpu_logits[i] = (float)cpu_logits_raw[i];
         }
-        if (targets != NULL) {
+        /*if (targets != NULL) {
             float maxLogit = cpu_logits[0];
             for (size_t j = 1; j < model->config.vocab_size; j++) {
                 if (cpu_logits[j] > maxLogit) maxLogit = cpu_logits[j];
@@ -1932,10 +1945,13 @@ void inference(GPT2* model,
                 sumExp += expf(cpu_logits[j] - maxLogit);
             }
             model->mean_loss = -(cpu_logits[targets[token]] - maxLogit - logf(sumExp));
-        }
+        }*/
         float coin = random_f32(rng_state);
         int next_token = sample_softmax(cpu_logits, model->config.vocab_size, coin);
-        prompt[token + 1] = next_token; // set next position for next iteration
+        prompt[tokenIndex + 1] = next_token; // set next position for next iteration
+        if (next_token == tokenizer->eot_token) {
+            break;
+        }
         if (print) {
             if (tokenizer->init_ok) {
                 safe_printf(tokenizer_decode(tokenizer, next_token));
@@ -1948,14 +1964,15 @@ void inference(GPT2* model,
     clock_gettime(CLOCK_MONOTONIC, &end);
     double timeTakenSeconds = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 	double timeToFirstTokenMillis = 1e3 * ((ttft.tv_sec - start.tv_sec) + (ttft.tv_nsec - start.tv_nsec) / 1e9);
+	const size_t numberActuallyGenerated = tokenIndex + 1 - contextLength; // +1 to convert index to count
     if (timesFile != NULL) {
-        write_times(timesFile, maxSequenceLength, timeTakenSeconds, timeToFirstTokenMillis);
+        write_times(timesFile, contextLength, numberActuallyGenerated, timeTakenSeconds, timeToFirstTokenMillis);
     }
     if (print) {
         printf("\nTime to first token: %lf ms\n", timeToFirstTokenMillis);
-        printf("\nTime to generate %zu tokens: %lf s -> %lf tokens/s\n", maxSequenceLength-contextLength, timeTakenSeconds, (double)(maxSequenceLength-contextLength)/timeTakenSeconds);
-        printf("\n---\n");
+        printf("\nTime to generate %zu tokens: %lf s -> %lf tokens/s\n", numberActuallyGenerated, timeTakenSeconds, (double)(numberActuallyGenerated)/timeTakenSeconds);
     }
+    printf("\n---\n");
 }
 
 float evaluate(EvalLoader* eval_loader,
@@ -2344,7 +2361,7 @@ int main(int argc, char* argv[]) {
             }
             // now sample from the model autoregressively
             cudaCheck(cudaMemset(model.acts_memory, 0, model.acts_memory_bytes));
-            inference(&model, &tokenizer, prompt, NULL, batchSize, sequenceLength, sequenceLength, &sample_rng_state, cpu_logits_raw, cpu_logits, timeFile);
+            inference(&model, &tokenizer, prompt, NULL, batchSize, sequenceLength, sequenceLength, &sample_rng_state, cpu_logits_raw, cpu_logits, timeFile, true);
         }
 
         // once in a while checkpoint the optimization state (all ranks)
