@@ -502,7 +502,7 @@ void layernorm_forward(floatX* output,
     NVTX_RANGE_FN();
     const int block_size = 256;
     int block_y = block_size / WARP_SIZE;
-    const int N = batchSize*(mode == PREFILL ? contextLength : maxSequenceLength);
+    const int N = batchSize*(mode == PREFILL ? contextLength : mode == INFERENCE ? 1 : maxSequenceLength);
     const int grid_size = CEIL_DIV(N, block_y);
     size_t smem = (2 + block_y) * dimensions * sizeof(float);
 
@@ -534,7 +534,7 @@ void residual_forward(floatX* out,
 ) {
     NVTX_RANGE_FN();
     const int block_size = 256;
-    const int N = batchSize*(mode == PREFILL ? contextLength : maxSequenceLength)*dimensions;
+    const int N = batchSize*(mode == PREFILL ? contextLength : mode == INFERENCE ? 1 : maxSequenceLength)*dimensions;
     assert(N % (block_size * x128::size) == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
     residual_forward_kernel<<<grid_size, block_size, 0, stream>>>(out, inp1, inp2);
@@ -562,9 +562,9 @@ void fused_residual_forward5(
     int block_y = block_size / WARP_SIZE;
     int N;
     switch (mode) {
-        case TRAIN_VAL: N = batchSize*maxSequenceLength*dimensions; break;
-        case PREFILL: N = batchSize*contextLength*dimensions; break;
-        case INFERENCE: N = batchSize*dimensions; break;
+        case TRAIN_VAL: N = batchSize*maxSequenceLength; break;
+        case PREFILL: N = batchSize*contextLength; break;
+        case INFERENCE: N = batchSize; break;
     }
     const int grid_size = CEIL_DIV(N, block_y);
     size_t smem = (2 + block_y) * dimensions * sizeof(float);

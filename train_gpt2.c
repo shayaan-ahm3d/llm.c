@@ -1680,14 +1680,14 @@ void gpt2_forward(GPT2* model,
         if (mode == INFERENCE) {
         	//if (currentToken) do some prefill
        		// query calculation: ordered (*Q*, K, V) in l_qkv, l_qkvw & l_qkvb
-        	cached_matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, batchSize, maxSequenceLength, dimensions, dimensions, mode, currentToken);
+        	cached_matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, batchSize, maxSequenceLength, dimensions, 3*dimensions, mode, currentToken);
          	// need correct offset for key and value within l_qkv, l_qkvw & l_qkvb as QKV are all together
           	// key calculation: +dimensions as ordered (Q, *K*, V) in l_qkv, l_qkvw & l_qkvb
           	float* key = l_qkv + dimensions;
-           	cached_matmul_forward(key, l_ln1, l_qkvw + dimensions*dimensions, l_qkvb + dimensions, batchSize, maxSequenceLength, dimensions, dimensions, mode, currentToken);
+           	cached_matmul_forward(key, l_ln1, l_qkvw + dimensions*dimensions, l_qkvb + dimensions, batchSize, maxSequenceLength, dimensions, 3*dimensions, mode, currentToken);
           	// value calculation: +dimensions*2 as ordered (Q, K, *V*) in l_qkv, l_qkvw & l_qkvb
           	float* value = l_qkv + dimensions*2;
-         	cached_matmul_forward(value, l_ln1, l_qkvw + dimensions*dimensions*2, l_qkvb + dimensions*2, batchSize, maxSequenceLength, dimensions, dimensions, mode, currentToken);
+         	cached_matmul_forward(value, l_ln1, l_qkvw + dimensions*dimensions*2, l_qkvb + dimensions*2, batchSize, maxSequenceLength, dimensions, 3*dimensions, mode, currentToken);
         } else {
        		matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, batchSize, contextLength, maxSequenceLength, dimensions, 3*dimensions, mode, currentToken);
         }
@@ -2056,6 +2056,8 @@ void error_usage() {
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
     fprintf(stderr, "  -h <int>    hellaswag eval run? (default = 0)\n");
+    fprintf(stderr, "  -H <string> hellaswag data file path (default = dev/data/hellaswag/hellaswag_val.bin)\n");
+    fprintf(stderr, "  -K <string> per-example loss CSV output path (default = none)\n");
     // debugging
     fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
     // numerics
@@ -2137,6 +2139,8 @@ int main(int argc, char* argv[]) {
     const char* CPU_TIMES = "cpu_times.csv";
     const char* CPU_LOGITS = "cpu_logits.log";
     const char* GPU_LOGITS = "gpu_logits.log";
+    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
+    const char* eval_csv_path = NULL;
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -2168,6 +2172,8 @@ int main(int argc, char* argv[]) {
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'H') { hellaswag_path = argv[i+1]; }
+        else if (argv[i][1] == 'K') { eval_csv_path = argv[i+1]; }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'f') { strcpy(fs_path, argv[i+1]); }
@@ -2246,7 +2252,6 @@ int main(int argc, char* argv[]) {
     }
     // build an EvalLoader for HellaSwag
     EvalLoader eval_loader;
-    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
     const bool hellaswag_available = access(hellaswag_path, F_OK) == 0;
     const bool run_hellaswag = hellaswag_eval && hellaswag_available;
     if (run_hellaswag) {
@@ -2255,6 +2260,11 @@ int main(int argc, char* argv[]) {
     	// no multi-GPU so can set index as 0 and total as 1
         evalloader_init(&eval_loader, hellaswag_path, 4, maxSequenceLength, 0, 1);
 	    evalloader_reset(&eval_loader);
+		FILE* eval_csv = NULL;
+		if (eval_csv_path != NULL) {
+			eval_csv = fopenCheck(eval_csv_path, "w");
+			fprintf(eval_csv, "seq_index,context_length,loss\n");
+		}
 		float cumulativeLoss = 0.f;
 		for (int i = 0; i < val_max_steps; ++i) {
 			evalloader_next_batch(&eval_loader);
@@ -2266,7 +2276,11 @@ int main(int argc, char* argv[]) {
 			assert(answer != NULL);
 			inference(&model, &tokenizer, prompt, answer, 1, contextLength, sequenceLength, &rng_state, NULL);
 			cumulativeLoss += model.mean_loss;
+			if (eval_csv != NULL) {
+				fprintf(eval_csv, "%d,%d,%f\n", eval_loader.exampleIndex, contextLength, model.mean_loss);
+			}
 		}
+		if (eval_csv != NULL) { fcloseCheck(eval_csv); }
 		printf("\nCPU Cumulative loss = %lf\n", cumulativeLoss);
         /*
         printf("Num Batches: %i\n", eval_loader.num_batches);
