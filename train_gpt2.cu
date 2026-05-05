@@ -1918,16 +1918,10 @@ void inference(GPT2* model,
         if (targets != NULL) {
             int targetToken = targets[tokenIndex];
             cudaCheck(cudaMemcpy(model->targets, &targetToken, sizeof(int), cudaMemcpyHostToDevice));
-            fused_classifier(logits,
-                model->acts.losses,
-                1.0f,
-                model->targets,
-                1,
-                1,
-                (int)model->config.vocab_size,
-                (int)model->config.padded_vocab_size,
-                False,
-                main_stream);
+            cudaCheck(cudaMemsetAsync(model->acts.losses, 0, sizeof(float), main_stream));
+            fused_classifier(logits, model->acts.losses, 1.0f, model->targets, 1, 1,
+                             (int)model->config.vocab_size, (int)model->config.padded_vocab_size,
+                             False, main_stream);
             cudaCheck(cudaMemcpyAsync(&model->mean_loss, model->acts.losses, sizeof(float), cudaMemcpyDeviceToHost, main_stream));
         }
         cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model->config.vocab_size*sizeof(float), cudaMemcpyDeviceToHost));
@@ -1935,17 +1929,6 @@ void inference(GPT2* model,
         for (int i = 0; i < model->config.vocab_size; i++) {
             cpu_logits[i] = (float)cpu_logits_raw[i];
         }
-        /*if (targets != NULL) {
-            float maxLogit = cpu_logits[0];
-            for (size_t j = 1; j < model->config.vocab_size; j++) {
-                if (cpu_logits[j] > maxLogit) maxLogit = cpu_logits[j];
-            }
-            float sumExp = 0.0f;
-            for (size_t j = 0; j < model->config.vocab_size; j++) {
-                sumExp += expf(cpu_logits[j] - maxLogit);
-            }
-            model->mean_loss = -(cpu_logits[targets[token]] - maxLogit - logf(sumExp));
-        }*/
         float coin = random_f32(rng_state);
         int next_token = sample_softmax(cpu_logits, model->config.vocab_size, coin);
         prompt[tokenIndex + 1] = next_token; // set next position for next iteration
@@ -1968,10 +1951,8 @@ void inference(GPT2* model,
     if (timesFile != NULL) {
         write_times(timesFile, contextLength, numberActuallyGenerated, timeTakenSeconds, timeToFirstTokenMillis);
     }
-    if (print) {
-        printf("\nTime to first token: %lf ms\n", timeToFirstTokenMillis);
-        printf("\nTime to generate %zu tokens: %lf s -> %lf tokens/s\n", numberActuallyGenerated, timeTakenSeconds, (double)(numberActuallyGenerated)/timeTakenSeconds);
-    }
+    printf("\nTime to first token: %lf ms\n", timeToFirstTokenMillis);
+    printf("\nTime to generate %zu tokens: %lf s -> %lf tokens/s\n", numberActuallyGenerated, timeTakenSeconds, (double)(numberActuallyGenerated)/timeTakenSeconds);
     printf("\n---\n");
 }
 
@@ -1985,7 +1966,8 @@ float evaluate(EvalLoader* eval_loader,
     float* cpu_logits_raw,
     float* cpu_logits,
     const char* gpu_losses_csv_path,
-    FILE* timeFile
+    FILE* timeFile,
+    const bool print
 ) {
     assert(eval_loader != NULL && model != NULL && tokenizer != NULL && gpu_losses_csv_path != NULL);
     NvtxRange evaluation_range("evaluation");
@@ -2007,7 +1989,7 @@ float evaluate(EvalLoader* eval_loader,
         // reset model before each inference pass
         cudaCheck(cudaMemset(model->acts_memory, 0, model->acts_memory_bytes));
         // run inference using the context and compute loss against the targets (correct HellaSwag completion)
-        inference(model, tokenizer, prompt, answer, 1, eval_loader->contextLength, maxSequenceLength, sample_rng_state, cpu_logits_raw, cpu_logits, timeFile, true);
+        inference(model, tokenizer, prompt, answer, 1, eval_loader->contextLength, maxSequenceLength, sample_rng_state, cpu_logits_raw, cpu_logits, timeFile, print);
         cumulativeLoss += model->mean_loss;
 
         fprintf(fp, "%d,%d,%f\n", eval_loader->current_example_index, eval_loader->contextLength, model->mean_loss);
@@ -2053,6 +2035,7 @@ int main(int argc, char* argv[]) {
     int hellaswag_eval = 1;
     const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
     const char* gpu_losses_csv_path = "gpu_eval_losses.csv";
+    bool printHellaSwag = true;
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -2091,7 +2074,7 @@ int main(int argc, char* argv[]) {
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'H') { hellaswag_path = argv[i+1]; }
+        else if (argv[i][1] == 'H') { printHellaSwag = (bool)atoi(argv[i+1]); }
         else if (argv[i][1] == 'K') { gpu_losses_csv_path = argv[i+1]; }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
@@ -2347,7 +2330,8 @@ int main(int argc, char* argv[]) {
                 cpu_logits_raw,
                 cpu_logits,
                 gpu_losses_csv_path,
-                timeFile);
+                timeFile,
+                printHellaSwag);
             printf("\nGPU Cumulative Loss = %lf\n", cumulativeLoss);
         }
 
