@@ -1993,10 +1993,8 @@ void inference(GPT2* model,
 	double timeToFirstTokenMillis = 1e3 * ((ttft.tv_sec - start.tv_sec) + (ttft.tv_nsec - start.tv_nsec) / 1e9);
 	const int numActuallyGenerated = currentToken + 1 - contextLength; // plus one to go from index to count
 	if (timesFile != NULL) write_times(timesFile, contextLength, numActuallyGenerated, timeTakenSeconds, timeToFirstTokenMillis);
-	if (print) {
-		printf("\nTime to first token: %lf ms\n", timeToFirstTokenMillis);
-		printf("Time to generate %i tokens: %lf s -> %lf tokens/s", numActuallyGenerated, timeTakenSeconds, (double)(numActuallyGenerated)/timeTakenSeconds);
-	}
+	printf("\nTime to first token: %lf ms\n", timeToFirstTokenMillis);
+	printf("Time to generate %i tokens: %lf s -> %lf tokens/s", numActuallyGenerated, timeTakenSeconds, (double)(numActuallyGenerated)/timeTakenSeconds);
 	printf("\n---\n");
 }
 
@@ -2148,7 +2146,7 @@ int main(int argc, char* argv[]) {
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'H') { printHellaSwag = argv[i+1]; }
+        else if (argv[i][1] == 'H') { printHellaSwag = (bool)atoi(argv[i+1]); }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'f') { strcpy(fs_path, argv[i+1]); }
