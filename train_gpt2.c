@@ -1920,11 +1920,6 @@ int sample_mult(float* probabilities, int n, float coin) {
     return n - 1; // in case of rounding errors
 }
 
-// Open file before this
-void write_times(FILE* file, int numTokensGenerated, double totalTimeSeconds, double timeToFirstTokenSeconds) {
-	fprintf(file, "%d,%lf,%lf\n", numTokensGenerated, totalTimeSeconds, timeToFirstTokenSeconds);
-}
-
 void inference(GPT2* model,
 	Tokenizer* tokenizer,
 	int* prompt,
@@ -1933,7 +1928,8 @@ void inference(GPT2* model,
 	const int contextLength,
 	const int maxSequenceLength,
 	uint64_t* rng_state,
-	FILE* timesFile
+	FILE* timesFile,
+	const bool print
 ) {
 	struct timespec start, end, ttft;
 	// now sample from the model autoregressively
@@ -1941,85 +1937,66 @@ void inference(GPT2* model,
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	// prefill
 	gpt2_forward(model, prompt, NULL, batchSize, contextLength, maxSequenceLength, PREFILL, 0);
-	float* probs = model->acts.probs + (contextLength-1)*model->config.padded_vocab_size;
+	float* probabilities = model->acts.probs + (contextLength-1)*model->config.padded_vocab_size;
 	float coin = random_f32(rng_state);
-	int firstOutputToken = sample_mult(probs, model->config.vocab_size, coin);
+	int firstOutputToken = sample_mult(probabilities, model->config.vocab_size, coin);
 	clock_gettime(CLOCK_MONOTONIC, &ttft);
 	prompt[contextLength] = firstOutputToken;
-#define PRINT
-#ifdef PRINT
-	for (int word = 0; word < contextLength; ++word) {
+	if (print) {
+		for (int word = 0; word < contextLength; ++word) {
+			if (tokenizer->init_ok) {
+			    const char* token_str = tokenizer_decode(tokenizer, prompt[word]);
+			    safe_printf(token_str);
+			} else {
+			    // fall back to printing the token id
+			    printf("%d ", prompt[word]);
+			}
+			fflush(stdout);
+		}
+		// print the generated token, either using the Tokenizer or a fallback
 		if (tokenizer->init_ok) {
-		    const char* token_str = tokenizer_decode(tokenizer, prompt[word]);
+		    const char* token_str = tokenizer_decode(tokenizer, firstOutputToken);
 		    safe_printf(token_str);
 		} else {
 		    // fall back to printing the token id
-		    printf("%d ", prompt[word]);
+		    printf("%d ", firstOutputToken);
 		}
 		fflush(stdout);
 	}
-	// print the generated token, either using the Tokenizer or a fallback
-	if (tokenizer->init_ok) {
-	    const char* token_str = tokenizer_decode(tokenizer, firstOutputToken);
-	    safe_printf(token_str);
-	} else {
-	    // fall back to printing the token id
-	    printf("%d ", firstOutputToken);
-	}
-	fflush(stdout);
-#endif
+
 	// decode
-	for (int currentToken = contextLength; currentToken < maxSequenceLength - 1; currentToken++) {
+	int currentToken = contextLength; // keep outside of loop so can count if broke early at the end
+	for (; currentToken < maxSequenceLength - 1; currentToken++) {
 		// this is where the key-value caching will come in
 		gpt2_forward(model, prompt, targets, batchSize, contextLength, maxSequenceLength, INFERENCE, currentToken);
-		// furthermore, below we're only using b=0 (i.e. the first row) of all B rows
-		// we're in principle running B "inference streams" in parallel here
-		// but only using position 0
-		// get the Vp-dimensional vector probs[0, t, :]
-		probs = model->acts.probs + currentToken*model->config.padded_vocab_size;
+		probabilities = model->acts.probs + currentToken*model->config.padded_vocab_size;
 		coin = random_f32(rng_state);
 		// note we're only sampling from the first V elements, ignoring padding
 		// (the probabilities in the padded region should be zero anyway)
-		int next_token = sample_mult(probs, model->config.vocab_size, coin);
+		int next_token = sample_mult(probabilities, model->config.vocab_size, coin);
+		prompt[currentToken + 1] = next_token;
 		if (next_token == tokenizer->eot_token) {
-			break; // stop generation
+			break; // stop generation if we hit <|endoftext|>
 		}
-		prompt[currentToken+1] = next_token;
-#ifdef PRINT
-		// print the generated token, either using the Tokenizer or a fallback
-		if (tokenizer->init_ok) {
-		    const char* token_str = tokenizer_decode(tokenizer, next_token);
-		    safe_printf(token_str);
-		} else {
-		    // fall back to printing the token id
-		    printf("%d ", next_token);
+		if (print) {
+			if (tokenizer->init_ok) {
+			    const char* token_str = tokenizer_decode(tokenizer, next_token);
+			    safe_printf(token_str);
+			} else {
+			    printf("%d ", next_token);
+			}
+			fflush(stdout);
 		}
-		fflush(stdout);
-#endif
 	}
 	clock_gettime(CLOCK_MONOTONIC, &end);
 	double timeTakenSeconds = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 	double timeToFirstTokenMillis = 1e3 * ((ttft.tv_sec - start.tv_sec) + (ttft.tv_nsec - start.tv_nsec) / 1e9);
-	if (timesFile != NULL) write_times(timesFile, maxSequenceLength-contextLength, timeTakenSeconds, timeToFirstTokenMillis);
-	/*if (logitsFile != NULL) {
-        const size_t V = model->config.vocab_size;
-        const size_t Vp = model->config.padded_vocab_size;
-        for (int sequence = 0; sequence < batchSize; ++sequence) {
-            for (int token = 0; token < sequenceLength - 1; ++token) {
-                const float* logits_bt = model->acts.logits + sequence*(size_t)sequenceLength*Vp + token*Vp;
-                const size_t wrote = fwrite(logits_bt, sizeof(float), V, logitsFile);
-                if (wrote != V) {
-                    fprintf(stderr, "Error: failed to write logits row\n");
-                    exit(1);
-                }
-            }
-        }
-    }*/
-#define DEBUG
-#ifdef DEBUG
-	printf("\nTime to first token: %lf ms\n", timeToFirstTokenMillis);
-	printf("Time to generate %i tokens: %lf s -> %lf tokens/s", maxSequenceLength-contextLength, timeTakenSeconds, (double)(maxSequenceLength-contextLength)/timeTakenSeconds);
-#endif
+	const int numActuallyGenerated = currentToken + 1 - contextLength; // plus one to go from index to count
+	if (timesFile != NULL) write_times(timesFile, contextLength, numActuallyGenerated, timeTakenSeconds, timeToFirstTokenMillis);
+	if (print) {
+		printf("\nTime to first token: %lf ms\n", timeToFirstTokenMillis);
+		printf("Time to generate %i tokens: %lf s -> %lf tokens/s", numActuallyGenerated, timeTakenSeconds, (double)(numActuallyGenerated)/timeTakenSeconds);
+	}
 	printf("\n---\n");
 }
 
@@ -2111,7 +2088,7 @@ int main(int argc, char* argv[]) {
     float skip_update_lossz = 0.0f; // skip update if loss goes above this in zscore
     float skip_update_gradz = 0.0f; // skip update if grad_norm goes above this in zscore
     int val_loss_every = 20; // every how many steps do we eval validation loss?
-    int val_max_steps = 3; // how many batches max do we eval for validation loss?
+    int val_max_steps = 1; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
     int numInferenceSteps = 1024; // number of steps of inference we will do / tokens will be generated
     int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
@@ -2121,7 +2098,7 @@ int main(int argc, char* argv[]) {
     int gelu_fusion = 2; // 0 = none, 1 = forward, 2 = forward+backward (-1 => per-GPU default)
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
-    bool hellaswag_eval = 0;
+    bool hellaswag_eval = 1;
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -2137,10 +2114,9 @@ int main(int argc, char* argv[]) {
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
     const char* saved_model_file = "gpt2_124M.bin";
     const char* CPU_TIMES = "cpu_times.csv";
-    const char* CPU_LOGITS = "cpu_logits.log";
-    const char* GPU_LOGITS = "gpu_logits.log";
     const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
-    const char* eval_csv_path = NULL;
+    const char* cpu_losses_csv_path = "cpu_eval_losses.csv";
+    bool printHellaSwag = true;
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -2172,8 +2148,7 @@ int main(int argc, char* argv[]) {
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'H') { hellaswag_path = argv[i+1]; }
-        else if (argv[i][1] == 'K') { eval_csv_path = argv[i+1]; }
+        else if (argv[i][1] == 'H') { printHellaSwag = argv[i+1]; }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'f') { strcpy(fs_path, argv[i+1]); }
@@ -2198,7 +2173,7 @@ int main(int argc, char* argv[]) {
     gpt2_build_from_checkpoint(&model, saved_model_file);
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
-    int sequenceLength = numInferenceSteps; // e.g. sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
+    int sequenceLength = numInferenceSteps; // e.g. sequence length 1024 (i.e. each sequence is 1024 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_tokens, batchSize, sequenceLength, 0, 1, 1);
     dataloader_init(&val_loader, val_tokens, batchSize, sequenceLength, 0, 1, 0);
@@ -2260,10 +2235,10 @@ int main(int argc, char* argv[]) {
     	// no multi-GPU so can set index as 0 and total as 1
         evalloader_init(&eval_loader, hellaswag_path, 4, maxSequenceLength, 0, 1);
 	    evalloader_reset(&eval_loader);
-		FILE* eval_csv = NULL;
-		if (eval_csv_path != NULL) {
-			eval_csv = fopenCheck(eval_csv_path, "w");
-			fprintf(eval_csv, "seq_index,context_length,loss\n");
+		FILE* fp = NULL;
+		if (cpu_losses_csv_path != NULL) {
+			fp = fopenCheck(cpu_losses_csv_path, "w");
+			fprintf(fp, "exampleIndex,contextLength,loss\n");
 		}
 		float cumulativeLoss = 0.f;
 		for (int i = 0; i < val_max_steps; ++i) {
@@ -2274,13 +2249,13 @@ int main(int argc, char* argv[]) {
 			// get the answers/correct tokens from the loader
 			const int* answer = evalloader_get_answer(&eval_loader);
 			assert(answer != NULL);
-			inference(&model, &tokenizer, prompt, answer, 1, contextLength, sequenceLength, &rng_state, NULL);
+			inference(&model, &tokenizer, prompt, answer, 1, contextLength, sequenceLength, &rng_state, timeFile, printHellaSwag);
 			cumulativeLoss += model.mean_loss;
-			if (eval_csv != NULL) {
-				fprintf(eval_csv, "%d,%d,%f\n", eval_loader.exampleIndex, contextLength, model.mean_loss);
+			if (fp != NULL) {
+				fprintf(fp, "%d,%d,%f\n", eval_loader.current_example_index, contextLength, model.mean_loss);
 			}
 		}
-		if (eval_csv != NULL) { fcloseCheck(eval_csv); }
+		if (fp != NULL) { fcloseCheck(fp); }
 		printf("\nCPU Cumulative loss = %lf\n", cumulativeLoss);
         /*
         printf("Num Batches: %i\n", eval_loader.num_batches);
