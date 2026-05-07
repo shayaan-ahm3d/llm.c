@@ -1834,8 +1834,8 @@ void error_usage() {
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
     fprintf(stderr, "  -h <int>    hellaswag eval run? (default = 0)\n");
-    fprintf(stderr, "  -H <string> hellaswag data file path (default = dev/data/hellaswag/hellaswag_val.bin)\n");
-    fprintf(stderr, "  -K <string> per-example loss CSV output path (default = none)\n");
+    fprintf(stderr, "  -H <string> hellaswag data file path (default = dev/data/hellaswag/hellaswag_sample.bin)\n");
+    fprintf(stderr, "  -K <string> per-example loss CSV output path (default = gpu_eval_losses.csv)\n");
     // debugging
     fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
     // numerics
@@ -1965,17 +1965,14 @@ float evaluate(EvalLoader* eval_loader,
     int* prompt,
     float* cpu_logits_raw,
     float* cpu_logits,
-    const char* gpu_losses_csv_path,
+    FILE* gpuLossesCsv,
     FILE* timeFile,
     const bool print
 ) {
-    assert(eval_loader != NULL && model != NULL && tokenizer != NULL && gpu_losses_csv_path != NULL);
+    assert(eval_loader != NULL && model != NULL && tokenizer != NULL && gpuLossesCsv != NULL);
     NvtxRange evaluation_range("evaluation");
     // reset before using
     evalloader_reset(eval_loader);
-
-    FILE* fp = fopenCheck(gpu_losses_csv_path, "w");
-    fprintf(fp, "exampleIndex,contextLength,loss\n");
 
     float cumulativeLoss = 0.0f;
     for (int i = 0; i < numberOfExamplesToTest; ++i) {
@@ -1992,9 +1989,8 @@ float evaluate(EvalLoader* eval_loader,
         inference(model, tokenizer, prompt, answer, 1, eval_loader->contextLength, maxSequenceLength, sample_rng_state, cpu_logits_raw, cpu_logits, timeFile, print);
         cumulativeLoss += model->mean_loss;
 
-        fprintf(fp, "%d,%d,%f\n", eval_loader->current_example_index, eval_loader->contextLength, model->mean_loss);
+        fprintf(gpuLossesCsv, "%d,%d,%f\n", eval_loader->current_example_index, eval_loader->contextLength, model->mean_loss);
     }
-    fcloseCheck(fp);
     return cumulativeLoss;
 }
 
@@ -2033,7 +2029,7 @@ int main(int argc, char* argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 1;
-    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
+    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_sample.bin";
     const char* gpu_losses_csv_path = "gpu_eval_losses.csv";
     bool printHellaSwag = true;
     // multi-node settings
@@ -2074,7 +2070,8 @@ int main(int argc, char* argv[]) {
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'H') { printHellaSwag = (bool)atoi(argv[i+1]); }
+        else if (argv[i][1] == 'H') { hellaswag_path = argv[i+1]; }
+        else if (argv[i][1] == 'Z') { printHellaSwag = (bool)atoi(argv[i+1]); }
         else if (argv[i][1] == 'K') { gpu_losses_csv_path = argv[i+1]; }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
@@ -2320,6 +2317,7 @@ int main(int argc, char* argv[]) {
 
         // once in a while estimate HellaSwag loss via inference
         if (run_hellaswag) {
+            FILE* gpuLossesCsv = fopenCheck(gpu_losses_csv_path, "a");
             const float cumulativeLoss = evaluate(&eval_loader,
                 &model,
                 &tokenizer,
@@ -2329,9 +2327,10 @@ int main(int argc, char* argv[]) {
                 prompt,
                 cpu_logits_raw,
                 cpu_logits,
-                gpu_losses_csv_path,
+                gpuLossesCsv,
                 timeFile,
                 printHellaSwag);
+            fcloseCheck(gpuLossesCsv);
             printf("\nGPU Cumulative Loss = %lf\n", cumulativeLoss);
         }
 

@@ -2031,8 +2031,8 @@ void error_usage() {
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
     fprintf(stderr, "  -h <int>    hellaswag eval run? (default = 0)\n");
-    fprintf(stderr, "  -H <string> hellaswag data file path (default = dev/data/hellaswag/hellaswag_val.bin)\n");
-    fprintf(stderr, "  -K <string> per-example loss CSV output path (default = none)\n");
+    fprintf(stderr, "  -H <string> hellaswag data file path (default = dev/data/hellaswag/hellaswag_sample.bin)\n");
+    fprintf(stderr, "  -K <string> per-example loss CSV output path (default = cpu_eval_losses.csv)\n");
     // debugging
     fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
     // numerics
@@ -2112,7 +2112,7 @@ int main(int argc, char* argv[]) {
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
     const char* saved_model_file = "gpt2_124M.bin";
     const char* CPU_TIMES = "cpu_times.csv";
-    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
+    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_sample.bin";
     const char* cpu_losses_csv_path = "cpu_eval_losses.csv";
     bool printHellaSwag = true;
     for (int i = 1; i < argc; i+=2) {
@@ -2146,7 +2146,9 @@ int main(int argc, char* argv[]) {
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'H') { printHellaSwag = (bool)atoi(argv[i+1]); }
+        else if (argv[i][1] == 'H') { hellaswag_path = argv[i+1]; }
+        else if (argv[i][1] == 'Z') { printHellaSwag = (bool)atoi(argv[i+1]); }
+        else if (argv[i][1] == 'K') { cpu_losses_csv_path = argv[i+1]; }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'f') { strcpy(fs_path, argv[i+1]); }
@@ -2233,11 +2235,9 @@ int main(int argc, char* argv[]) {
     	// no multi-GPU so can set index as 0 and total as 1
         evalloader_init(&eval_loader, hellaswag_path, 4, maxSequenceLength, 0, 1);
 	    evalloader_reset(&eval_loader);
-		FILE* fp = NULL;
-		if (cpu_losses_csv_path != NULL) {
-			fp = fopenCheck(cpu_losses_csv_path, "w");
-			fprintf(fp, "exampleIndex,contextLength,loss\n");
-		}
+
+		FILE* cpuLossesCsv = fopenCheck(cpu_losses_csv_path, "a");
+
 		float cumulativeLoss = 0.f;
 		for (int i = 0; i < val_max_steps; ++i) {
 			evalloader_next_batch(&eval_loader);
@@ -2249,11 +2249,10 @@ int main(int argc, char* argv[]) {
 			assert(answer != NULL);
 			inference(&model, &tokenizer, prompt, answer, 1, contextLength, sequenceLength, &rng_state, timeFile, printHellaSwag);
 			cumulativeLoss += model.mean_loss;
-			if (fp != NULL) {
-				fprintf(fp, "%d,%d,%f\n", eval_loader.current_example_index, contextLength, model.mean_loss);
-			}
+
+			fprintf(cpuLossesCsv, "%d,%d,%f\n", eval_loader.current_example_index, contextLength, model.mean_loss);
 		}
-		if (fp != NULL) { fcloseCheck(fp); }
+		fcloseCheck(cpuLossesCsv);
 		printf("\nCPU Cumulative loss = %lf\n", cumulativeLoss);
         /*
         printf("Num Batches: %i\n", eval_loader.num_batches);
