@@ -1377,7 +1377,6 @@ int main(int argc, char* argv[]) {
         FILE* tokenTimeFile = fopenCheck(CPU_TOKEN_TIMES, "a");
         FILE* cpuLossesCsv = fopenCheck(cpu_losses_csv_path, "a");
 
-        // separate prompt buffer at full sequence length T (training prompt above is sized for sequenceLength)
         int* inferencePrompt = (int*)mallocCheck(T * sizeof(int));
 
         for (int i = 0; i < val_max_steps; ++i) {

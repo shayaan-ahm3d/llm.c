@@ -293,7 +293,7 @@ typedef struct {
     char* mask; // mask=1 at all completion token locations
     int* label; // the correct completion labels
     int num_completions; // number of completions for this example
-    int contextLength; // length of the context (prompt) for the most recently loaded example
+    int contextLength; // length of the context (prompt)
 } EvalLoader;
 
 void evalloader_reset(EvalLoader *loader) {

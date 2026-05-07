@@ -1415,7 +1415,6 @@ void error_usage() {
 }
 
 // ----------------------------------------------------------------------------
-// inference helper for HellaSwag-style benchmarking with per-token timing
 void inference(GPT2* model,
     Tokenizer* tokenizer,
     int* prompt,
