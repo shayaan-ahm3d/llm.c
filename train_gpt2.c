@@ -1929,9 +1929,12 @@ void inference(GPT2* model,
 	const int maxSequenceLength,
 	uint64_t* rng_state,
 	FILE* timesFile,
+	FILE* tokenTimesFile,
 	const bool print
 ) {
-	struct timespec start, end, ttft;
+	static int callIndex = 0;
+	callIndex++;
+	struct timespec start, end, ttft, tokStart, tokEnd;
 	// now sample from the model autoregressively
 	printf("Generating:\n---\n");
 	clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1967,6 +1970,7 @@ void inference(GPT2* model,
 	// decode
 	int currentToken = contextLength; // keep outside of loop so can count if broke early at the end
 	for (; currentToken < maxSequenceLength - 1; currentToken++) {
+		clock_gettime(CLOCK_MONOTONIC, &tokStart);
 		// this is where the key-value caching will come in
 		gpt2_forward(model, prompt, targets, batchSize, contextLength, maxSequenceLength, INFERENCE, currentToken);
 		probabilities = model->acts.probs + currentToken*model->config.padded_vocab_size;
@@ -1975,6 +1979,11 @@ void inference(GPT2* model,
 		// (the probabilities in the padded region should be zero anyway)
 		int next_token = sample_mult(probabilities, model->config.vocab_size, coin);
 		prompt[currentToken + 1] = next_token;
+		clock_gettime(CLOCK_MONOTONIC, &tokEnd);
+		if (tokenTimesFile != NULL) {
+			double tokMs = 1e3 * ((tokEnd.tv_sec - tokStart.tv_sec) + (tokEnd.tv_nsec - tokStart.tv_nsec) / 1e9);
+			fprintf(tokenTimesFile, "%d,%d,%lf\n", callIndex, currentToken - contextLength + 1, tokMs);
+		}
 		if (next_token == tokenizer->eot_token) {
 			break; // stop generation if we hit <|endoftext|>
 		}
@@ -2112,6 +2121,7 @@ int main(int argc, char* argv[]) {
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
     const char* saved_model_file = "gpt2_124M.bin";
     const char* CPU_TIMES = "cpu_times.csv";
+    const char* CPU_TOKEN_TIMES = "cpu_token_times.csv";
     const char* hellaswag_path = "dev/data/hellaswag/hellaswag_sample.bin";
     const char* cpu_losses_csv_path = "cpu_eval_losses.csv";
     bool printHellaSwag = true;
@@ -2164,6 +2174,7 @@ int main(int argc, char* argv[]) {
     }
 
     FILE* timeFile = fopenCheck(CPU_TIMES, "a");
+    FILE* tokenTimeFile = fopenCheck(CPU_TOKEN_TIMES, "a");
 
     Logger logger;
     logger_init(&logger, output_log_dir, 0, resume);
@@ -2210,7 +2221,7 @@ int main(int argc, char* argv[]) {
 			prompt[i] = tokenizer.eot_token;
 		}
 		memset(model.acts_memory, 0, model.num_activations * sizeof(float));
-        inference(&model, &tokenizer, prompt, NULL, batchSize, 1, sequenceLength, &rng_state, timeFile);
+        inference(&model, &tokenizer, prompt, NULL, batchSize, 1, sequenceLength, &rng_state, timeFile, tokenTimeFile);
         */
         // do a training step
         /*
@@ -2247,7 +2258,7 @@ int main(int argc, char* argv[]) {
 			// get the answers/correct tokens from the loader
 			const int* answer = evalloader_get_answer(&eval_loader);
 			assert(answer != NULL);
-			inference(&model, &tokenizer, prompt, answer, 1, contextLength, sequenceLength, &rng_state, timeFile, printHellaSwag);
+			inference(&model, &tokenizer, prompt, answer, 1, contextLength, sequenceLength, &rng_state, timeFile, tokenTimeFile, printHellaSwag);
 			cumulativeLoss += model.mean_loss;
 
 			fprintf(cpuLossesCsv, "%d,%d,%f\n", eval_loader.current_example_index, contextLength, model.mean_loss);
@@ -2279,6 +2290,7 @@ int main(int argc, char* argv[]) {
     gpt2_free(&model);
     free(prompt);
     fcloseCheck(timeFile);
+    fcloseCheck(tokenTimeFile);
     return EXIT_SUCCESS;
 }
 #endif

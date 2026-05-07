@@ -1866,10 +1866,13 @@ void inference(GPT2* model,
     float* cpu_logits_raw,
     float* cpu_logits,
 	FILE* timesFile,
+	FILE* tokenTimesFile,
     bool print = true
 ) {
     assert(batchSize == 1);
-    struct timespec start, end, ttft;
+    static int callIndex = 0;
+    callIndex++;
+    struct timespec start, end, ttft, tokStart, tokEnd;
     NvtxRange generation_range("Inference prefill");
     printf("Generating:\n---\n");
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1911,7 +1914,7 @@ void inference(GPT2* model,
     size_t tokenIndex = contextLength; // keep outside for loop so can count number actually generated at the end
     for (; tokenIndex < maxSequenceLength - 1; tokenIndex++) {
         NvtxRange generation_range("Inference decode, step", tokenIndex);
-
+        clock_gettime(CLOCK_MONOTONIC, &tokStart);
         gpt2_forward_inference(model, prompt, targets, batchSize, contextLength, maxSequenceLength, INFERENCE, tokenIndex);
         // logit at position token predicts targets[token] (the next token)
         floatX* logits = model->acts.output + tokenIndex*model->config.padded_vocab_size;
@@ -1932,6 +1935,11 @@ void inference(GPT2* model,
         float coin = random_f32(rng_state);
         int next_token = sample_softmax(cpu_logits, model->config.vocab_size, coin);
         prompt[tokenIndex + 1] = next_token; // set next position for next iteration
+        clock_gettime(CLOCK_MONOTONIC, &tokEnd);
+        if (tokenTimesFile != NULL) {
+            double tokMs = 1e3 * ((tokEnd.tv_sec - tokStart.tv_sec) + (tokEnd.tv_nsec - tokStart.tv_nsec) / 1e9);
+            fprintf(tokenTimesFile, "%d,%zu,%lf\n", callIndex, tokenIndex - contextLength + 1, tokMs);
+        }
         if (next_token == tokenizer->eot_token) {
             break;
         }
@@ -1967,6 +1975,7 @@ float evaluate(EvalLoader* eval_loader,
     float* cpu_logits,
     FILE* gpuLossesCsv,
     FILE* timeFile,
+    FILE* tokenTimeFile,
     const bool print
 ) {
     assert(eval_loader != NULL && model != NULL && tokenizer != NULL && gpuLossesCsv != NULL);
@@ -1986,7 +1995,7 @@ float evaluate(EvalLoader* eval_loader,
         // reset model before each inference pass
         cudaCheck(cudaMemset(model->acts_memory, 0, model->acts_memory_bytes));
         // run inference using the context and compute loss against the targets (correct HellaSwag completion)
-        inference(model, tokenizer, prompt, answer, 1, eval_loader->contextLength, maxSequenceLength, sample_rng_state, cpu_logits_raw, cpu_logits, timeFile, print);
+        inference(model, tokenizer, prompt, answer, 1, eval_loader->contextLength, maxSequenceLength, sample_rng_state, cpu_logits_raw, cpu_logits, timeFile, tokenTimeFile, print);
         cumulativeLoss += model->mean_loss;
 
         fprintf(gpuLossesCsv, "%d,%d,%f\n", eval_loader->current_example_index, eval_loader->contextLength, model->mean_loss);
@@ -2289,7 +2298,9 @@ int main(int argc, char* argv[]) {
 
     // train
     const char* GPU_TIMES = "gpu_times.csv";
+    const char* GPU_TOKEN_TIMES = "gpu_token_times.csv";
     FILE* timeFile = fopenCheck(GPU_TIMES, "a");
+    FILE* tokenTimeFile = fopenCheck(GPU_TOKEN_TIMES, "a");
     uint64_t sample_rng_state = 1337;
     cudaEvent_t start, end;
     cudaCheck(cudaEventCreate(&start));
@@ -2329,6 +2340,7 @@ int main(int argc, char* argv[]) {
                 cpu_logits,
                 gpuLossesCsv,
                 timeFile,
+                tokenTimeFile,
                 printHellaSwag);
             fcloseCheck(gpuLossesCsv);
             printf("\nGPU Cumulative Loss = %lf\n", cumulativeLoss);
@@ -2344,7 +2356,7 @@ int main(int argc, char* argv[]) {
             }
             // now sample from the model autoregressively
             cudaCheck(cudaMemset(model.acts_memory, 0, model.acts_memory_bytes));
-            inference(&model, &tokenizer, prompt, NULL, batchSize, sequenceLength, sequenceLength, &sample_rng_state, cpu_logits_raw, cpu_logits, timeFile, true);
+            inference(&model, &tokenizer, prompt, NULL, batchSize, sequenceLength, sequenceLength, &sample_rng_state, cpu_logits_raw, cpu_logits, timeFile, tokenTimeFile, true);
         }
 
         // once in a while checkpoint the optimization state (all ranks)
@@ -2452,6 +2464,7 @@ int main(int argc, char* argv[]) {
     gpt2_free(&model);
     common_free(model);
     fcloseCheck(timeFile);
+    fcloseCheck(tokenTimeFile);
     return EXIT_SUCCESS;
 }
 #endif
