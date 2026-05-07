@@ -1077,38 +1077,63 @@ int sample_mult(float* probabilities, int n, float coin) {
 void inference(GPT2* model,
 	Tokenizer* tokenizer,
 	int* prompt,
-	const int numTokensToGenerate,
+	const int contextLength,
 	const int batchSize,
 	const int sequenceLength,
-	uint64_t* rng_state
+	uint64_t* rng_state,
+	FILE* timesFile,
+	FILE* tokenTimesFile,
+	const bool print
 ) {
-	// now sample from the model autoregressively
+	static int callIndex = 0;
+	callIndex++;
+	struct timespec start, end, ttft, tokStart, tokEnd;
 	printf("generating:\n---\n");
-	for (int t = 1; t < numTokensToGenerate; t++) {
-		// note that inference is very wasteful here because for each token
-		// we re-calculate the forward pass for all of (B,T) positions from scratch
-		// and we can maybe optimize a bit more later, with careful tests
-		gpt2_forward(model, prompt, NULL, batchSize, sequenceLength);
-		// furthermore, below we're only using b=0 (i.e. the first row) of all B rows
-		// we're in principle running B "inference streams" in parallel here
-		// but only using position 0
-		// get the Vp-dimensional vector probs[0, t-1, :]
-		float* probs = model->acts.probs + (t-1) * model->config.padded_vocab_size;
-		float coin = random_f32(rng_state);
-		// note we're only sampling from the first V elements, ignoring padding
-		// (the probabilities in the padded region should be zero anyway)
-		int next_token = sample_mult(probs, model->config.vocab_size, coin);
-		prompt[t] = next_token;
-		// print the generated token, either using the Tokenizer or a fallback
-		if (tokenizer->init_ok) {
-		    const char* token_str = tokenizer_decode(tokenizer, next_token);
-		    safe_printf(token_str);
-		} else {
-		    // fall back to printing the token id
-		    printf("%d ", next_token);
+	if (print) {
+		for (int i = 0; i < contextLength; i++) {
+			if (tokenizer->init_ok) {
+				safe_printf(tokenizer_decode(tokenizer, prompt[i]));
+			} else {
+				printf("%d ", prompt[i]);
+			}
 		}
 		fflush(stdout);
 	}
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	int t;
+	for (t = contextLength; t < sequenceLength; t++) {
+		// note that inference is very wasteful here because for each token
+		// we re-calculate the forward pass for all of (B,T) positions from scratch
+		clock_gettime(CLOCK_MONOTONIC, &tokStart);
+		gpt2_forward(model, prompt, NULL, batchSize, sequenceLength);
+		float* probs = model->acts.probs + (t-1) * model->config.padded_vocab_size;
+		float coin = random_f32(rng_state);
+		int next_token = sample_mult(probs, model->config.vocab_size, coin);
+		prompt[t] = next_token;
+		clock_gettime(CLOCK_MONOTONIC, &tokEnd);
+		if (t == contextLength) {
+			ttft = tokEnd;
+		}
+		if (tokenTimesFile != NULL) {
+			double tokMs = 1e3 * ((tokEnd.tv_sec - tokStart.tv_sec) + (tokEnd.tv_nsec - tokStart.tv_nsec) / 1e9);
+			fprintf(tokenTimesFile, "%d,%d,%lf\n", callIndex, t - contextLength + 1, tokMs);
+		}
+		if (print) {
+			if (tokenizer->init_ok) {
+				safe_printf(tokenizer_decode(tokenizer, next_token));
+			} else {
+				printf("%d ", next_token);
+			}
+			fflush(stdout);
+		}
+	}
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	double timeTakenSeconds = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+	double timeToFirstTokenMillis = 1e3 * ((ttft.tv_sec - start.tv_sec) + (ttft.tv_nsec - start.tv_nsec) / 1e9);
+	int numActuallyGenerated = t - contextLength;
+	if (timesFile != NULL) write_times(timesFile, contextLength, numActuallyGenerated, timeTakenSeconds, timeToFirstTokenMillis);
+	printf("\nTime to first token: %lf ms\n", timeToFirstTokenMillis);
+	printf("Time to generate %d tokens: %lf s -> %lf tokens/s\n", numActuallyGenerated, timeTakenSeconds, (double)numActuallyGenerated/timeTakenSeconds);
 	printf("\n---\n");
 }
 
@@ -1223,6 +1248,9 @@ int main(int argc, char* argv[]) {
     const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
     const char* saved_model_file = "gpt2_124M.bin";
+    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
+    const char* cpu_losses_csv_path = "cpu_eval_losses.csv";
+    bool printHellaSwag = true;
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -1254,6 +1282,9 @@ int main(int argc, char* argv[]) {
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'H') { hellaswag_path = argv[i+1]; }
+        else if (argv[i][1] == 'K') { cpu_losses_csv_path = argv[i+1]; }
+        else if (argv[i][1] == 'Z') { printHellaSwag = (bool)atoi(argv[i+1]); }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'f') { strcpy(fs_path, argv[i+1]); }
@@ -1315,7 +1346,7 @@ int main(int argc, char* argv[]) {
 		for (int i = 0; i < batchSize * sequenceLength; ++i) {
 			prompt[i] = tokenizer.eot_token;
 		}
-        inference(&model, &tokenizer, prompt, numInferenceSteps, batchSize, sequenceLength, &rng_state);
+        inference(&model, &tokenizer, prompt, 1, batchSize, sequenceLength, &rng_state, NULL, NULL, true);
 
         // do a training step
         clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1330,27 +1361,40 @@ int main(int argc, char* argv[]) {
     }
     // build an EvalLoader for HellaSwag
     EvalLoader eval_loader;
-    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
     const bool hellaswag_available = access(hellaswag_path, F_OK) == 0;
-    printf("Hella Swag Available: %i", hellaswag_available);
+    printf("Hella Swag Available: %i\n", hellaswag_available);
     const bool run_hellaswag = hellaswag_eval && hellaswag_available;
     if (run_hellaswag) {
-    	// no multi-GPU so can set index as 0 and total as 1
+        // no multi-GPU so can set index as 0 and total as 1
         evalloader_init(&eval_loader, hellaswag_path, B, T, 0, 1);
         printf("| run hellaswag         | %-50s |\n", run_hellaswag ? "yes" : "no");
         puts("+-----------------------+----------------------------------------------------+\n");
-	    float eval_acc_norm = 0.0f;
-	    evalloader_reset(&eval_loader);
-		printf("Num Batches: %i\n", eval_loader.num_batches);
-	    for (int i = 0; i < eval_loader.num_batches; i++) {
-	        printf("evaluating HellaSwag: %d/%d\r", i, eval_loader.num_batches);
-			fflush(stdout);
-	        evalloader_next_batch(&eval_loader);
-	        gpt2_validate(&model, eval_loader.inputs, eval_loader.targets, B, T);
-	        int correct = evalloader_stat_losses(&eval_loader, model.acts.losses);
-	        eval_acc_norm += (float)correct;
-	    }
-	    printf("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
+        evalloader_reset(&eval_loader);
+
+        const char* CPU_TIMES = "cpu_times.csv";
+        const char* CPU_TOKEN_TIMES = "cpu_token_times.csv";
+        FILE* timeFile = fopenCheck(CPU_TIMES, "a");
+        FILE* tokenTimeFile = fopenCheck(CPU_TOKEN_TIMES, "a");
+        FILE* cpuLossesCsv = fopenCheck(cpu_losses_csv_path, "a");
+
+        // separate prompt buffer at full sequence length T (training prompt above is sized for sequenceLength)
+        int* inferencePrompt = (int*)mallocCheck(T * sizeof(int));
+
+        for (int i = 0; i < val_max_steps; ++i) {
+            evalloader_next_batch(&eval_loader);
+            const int contextLength = eval_loader.contextLength;
+            // initialise full T with EOT so positions beyond context are valid tokens
+            for (int k = 0; k < T; k++) { inferencePrompt[k] = tokenizer.eot_token; }
+            for (int k = 0; k < contextLength; k++) {
+                inferencePrompt[k] = eval_loader.inputs[k];
+            }
+            inference(&model, &tokenizer, inferencePrompt, contextLength, 1, T, &rng_state, timeFile, tokenTimeFile, printHellaSwag);
+            fprintf(cpuLossesCsv, "%d,%d,%f\n", eval_loader.current_example_index, contextLength, model.mean_loss);
+        }
+        free(inferencePrompt);
+        fcloseCheck(timeFile);
+        fcloseCheck(tokenTimeFile);
+        fcloseCheck(cpuLossesCsv);
     }
     // free
     dataloader_free(&train_loader);

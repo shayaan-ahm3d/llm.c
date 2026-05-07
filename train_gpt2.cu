@@ -1415,6 +1415,77 @@ void error_usage() {
 }
 
 // ----------------------------------------------------------------------------
+// inference helper for HellaSwag-style benchmarking with per-token timing
+void inference(GPT2* model,
+    Tokenizer* tokenizer,
+    int* prompt,
+    const int contextLength,
+    const size_t batchSize,
+    const size_t sequenceLength,
+    unsigned long long* rng_state,
+    floatX* cpu_logits_raw,
+    float* cpu_logits,
+    FILE* timesFile,
+    FILE* tokenTimesFile,
+    bool print = true
+) {
+    static int callIndex = 0;
+    callIndex++;
+    struct timespec start, end, ttft, tokStart, tokEnd;
+    printf("Generating:\n---\n");
+    if (print) {
+        for (int i = 0; i < contextLength; i++) {
+            if (tokenizer->init_ok) {
+                safe_printf(tokenizer_decode(tokenizer, prompt[i]));
+            } else {
+                printf("%d ", prompt[i]);
+            }
+        }
+        fflush(stdout);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    int t;
+    for (t = contextLength; t < (int)sequenceLength; t++) {
+        clock_gettime(CLOCK_MONOTONIC, &tokStart);
+        size_t Tcur = CEIL_DIV(t, min(sequenceLength, (size_t)256)) * min(sequenceLength, (size_t)256);
+        gpt2_forward(model, prompt, batchSize, Tcur);
+        floatX* logits = model->acts.output + (t - 1) * model->config.padded_vocab_size;
+        cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model->config.vocab_size * sizeof(floatX), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaDeviceSynchronize());
+        for (int i = 0; i < model->config.vocab_size; i++) {
+            cpu_logits[i] = (float)cpu_logits_raw[i];
+        }
+        float coin = random_f32(rng_state);
+        int next_token = sample_softmax(cpu_logits, model->config.vocab_size, coin);
+        prompt[t] = next_token;
+        clock_gettime(CLOCK_MONOTONIC, &tokEnd);
+        if (t == contextLength) {
+            ttft = tokEnd;
+        }
+        if (tokenTimesFile != NULL) {
+            double tokMs = 1e3 * ((tokEnd.tv_sec - tokStart.tv_sec) + (tokEnd.tv_nsec - tokStart.tv_nsec) / 1e9);
+            fprintf(tokenTimesFile, "%d,%d,%lf\n", callIndex, t - contextLength + 1, tokMs);
+        }
+        if (print) {
+            if (tokenizer->init_ok) {
+                safe_printf(tokenizer_decode(tokenizer, next_token));
+            } else {
+                printf("%d ", next_token);
+            }
+            fflush(stdout);
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double timeTakenSeconds = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double timeToFirstTokenMillis = 1e3 * ((ttft.tv_sec - start.tv_sec) + (ttft.tv_nsec - start.tv_nsec) / 1e9);
+    int numActuallyGenerated = t - contextLength;
+    if (timesFile != NULL) write_times(timesFile, contextLength, numActuallyGenerated, timeTakenSeconds, timeToFirstTokenMillis);
+    printf("\nTime to first token: %lf ms\n", timeToFirstTokenMillis);
+    printf("Time to generate %d tokens: %lf s -> %lf tokens/s\n", numActuallyGenerated, timeTakenSeconds, (double)numActuallyGenerated/timeTakenSeconds);
+    printf("\n---\n");
+}
+
+// ----------------------------------------------------------------------------
 // main training loop
 int main(int argc, char *argv[]) {
     // read in the (optional) command line arguments
@@ -1456,6 +1527,9 @@ int main(int argc, char *argv[]) {
     char nccl_init_method[256] = "mpi";  // "tcp" or "fs" or "mpi"
     char server_ip[256] = "";  // used if init_method set to "tcp" -> set to your server ip address
     char fs_path[256] = "";  // used if init_method set to "fs" -> set to a shared filesystem path
+    const char* hellaswag_path_arg = NULL;
+    const char* gpu_losses_csv_path = "gpu_eval_losses.csv";
+    bool printHellaSwag = true;
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -1487,6 +1561,9 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'H') { hellaswag_path_arg = argv[i+1]; }
+        else if (argv[i][1] == 'K') { gpu_losses_csv_path = argv[i+1]; }
+        else if (argv[i][1] == 'Z') { printHellaSwag = (bool)atoi(argv[i+1]); }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'f') { strcpy(fs_path, argv[i+1]); }
@@ -1625,7 +1702,7 @@ int main(int argc, char *argv[]) {
 
     // build an EvalLoader for HellaSwag
     EvalLoader eval_loader;
-    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
+    const char* hellaswag_path = (hellaswag_path_arg != NULL) ? hellaswag_path_arg : "dev/data/hellaswag/hellaswag_val.bin";
     const bool hellaswag_available = access(hellaswag_path, F_OK) == 0;
     const bool run_hellaswag = hellaswag_eval && hellaswag_available;
     if (run_hellaswag) {
@@ -1709,7 +1786,7 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaProfilerStart());
     double total_sum_iteration_time_s = 0.0;
     float ema_tokens_per_second = 0.0f;
-    for (; step <= train_num_batches; step++) {
+    for (; step < train_num_batches; step++) {
         NvtxRange step_range("Train step", step);
 
         int last_step = step == train_num_batches;
@@ -1729,23 +1806,31 @@ int main(int argc, char *argv[]) {
             logger_log_val(&logger, step, val_loss);
         }
 
-        // once in a while estimate HellaSwag accuracy (all processes collaborate)
-        if (run_hellaswag &&
-           ((step > 0 && step % val_loss_every == 0) || last_step)) {
+        // HellaSwag inference benchmark (per-prompt autoregressive generation with timing)
+        if (run_hellaswag) {
             NvtxRange evaluation_range("evaluation");
-            float eval_acc_norm = 0.0f;
+            const char* GPU_TIMES = "gpu_times.csv";
+            const char* GPU_TOKEN_TIMES = "gpu_token_times.csv";
+            FILE* timeFile = fopenCheck(GPU_TIMES, "a");
+            FILE* tokenTimeFile = fopenCheck(GPU_TOKEN_TIMES, "a");
+            FILE* gpuLossesCsv = fopenCheck(gpu_losses_csv_path, "a");
+            unsigned long long sample_rng_state = 1337;
             evalloader_reset(&eval_loader);
-            for (int i = 0; i < eval_loader.num_batches; i++) {
-                if (i % 10 == 0) { printf("evaluating HellaSwag: %d/%d\r", i, eval_loader.num_batches); }
+            int* inferencePrompt = (int*)mallocCheck(T * sizeof(int));
+            for (int i = 0; i < val_max_steps; i++) {
                 evalloader_next_batch(&eval_loader);
-                gpt2_validate(&model, eval_loader.inputs, eval_loader.targets, B, T);
-                int correct = evalloader_stat_losses(&eval_loader, model.cpu_losses);
-                eval_acc_norm += (float)correct;
+                const int contextLength = eval_loader.contextLength;
+                for (int k = 0; k < T; k++) { inferencePrompt[k] = tokenizer.eot_token; }
+                for (int k = 0; k < contextLength; k++) {
+                    inferencePrompt[k] = eval_loader.inputs[k];
+                }
+                inference(&model, &tokenizer, inferencePrompt, contextLength, 1, T, &sample_rng_state, cpu_logits_raw, cpu_logits, timeFile, tokenTimeFile, printHellaSwag);
+                fprintf(gpuLossesCsv, "%d,%d,%f\n", eval_loader.current_example_index, contextLength, model.mean_loss);
             }
-            // careful because not all ranks may have the exact same allocation of number of examples
-            eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm, &multi_gpu_config);
-            printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
-            logger_log_eval(&logger, step, eval_acc_norm / eval_loader.num_examples);
+            free(inferencePrompt);
+            fcloseCheck(timeFile);
+            fcloseCheck(tokenTimeFile);
+            fcloseCheck(gpuLossesCsv);
         }
 
         // once in a while do model inference to print generated text (only rank 0)

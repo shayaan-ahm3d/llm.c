@@ -220,4 +220,13 @@ extern inline int ends_with_bin(const char* str) {
     return suffix_matches;
 }
 
+extern inline void write_times(FILE* file,
+	const int contextLength,
+	const int numTokensGenerated,
+	const double totalTimeSeconds,
+	const double timeToFirstTokenMillis
+) {
+	fprintf(file, "%i,%i,%lf,%lf\n", contextLength, numTokensGenerated, totalTimeSeconds, timeToFirstTokenMillis);
+}
+
 #endif

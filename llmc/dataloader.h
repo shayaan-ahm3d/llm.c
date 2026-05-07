@@ -293,6 +293,7 @@ typedef struct {
     char* mask; // mask=1 at all completion token locations
     int* label; // the correct completion labels
     int num_completions; // number of completions for this example
+    int contextLength; // length of the context (prompt) for the most recently loaded example
 } EvalLoader;
 
 void evalloader_reset(EvalLoader *loader) {
@@ -413,6 +414,7 @@ void evalloader_next_example_(EvalLoader *loader, int example_batch_index) {
     int context_length = (int)loader->buffer[2];
     uint16_t *context_tokens_start = &loader->buffer[3]; // where the tokens start
     assert(context_length > 0 && context_length < T); // context is non-empty and up to T
+    loader->contextLength = context_length;
     for (int b = 0; b < num_completions; b++) {
         for (int i = 0; i < context_length; i++) {
             int boff = batch_dim_offset + b;
