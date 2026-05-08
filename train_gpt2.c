@@ -1250,6 +1250,8 @@ int main(int argc, char* argv[]) {
     const char* saved_model_file = "gpt2_124M.bin";
     const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
     const char* cpu_losses_csv_path = "cpu_eval_losses.csv";
+    const char* cpu_times_csv_path = "cpu_times.csv";
+    const char* cpu_token_times_csv_path = "cpu_token_times.csv";
     bool printHellaSwag = true;
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
@@ -1284,6 +1286,8 @@ int main(int argc, char* argv[]) {
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
         else if (argv[i][1] == 'H') { hellaswag_path = argv[i+1]; }
         else if (argv[i][1] == 'K') { cpu_losses_csv_path = argv[i+1]; }
+        else if (argv[i][1] == 'T') { cpu_times_csv_path = argv[i+1]; }
+        else if (argv[i][1] == 'P') { cpu_token_times_csv_path = argv[i+1]; }
         else if (argv[i][1] == 'Z') { printHellaSwag = (bool)atoi(argv[i+1]); }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
@@ -1371,10 +1375,8 @@ int main(int argc, char* argv[]) {
         puts("+-----------------------+----------------------------------------------------+\n");
         evalloader_reset(&eval_loader);
 
-        const char* CPU_TIMES = "cpu_times.csv";
-        const char* CPU_TOKEN_TIMES = "cpu_token_times.csv";
-        FILE* timeFile = fopenCheck(CPU_TIMES, "a");
-        FILE* tokenTimeFile = fopenCheck(CPU_TOKEN_TIMES, "a");
+        FILE* timeFile = fopenCheck(cpu_times_csv_path, "a");
+        FILE* tokenTimeFile = fopenCheck(cpu_token_times_csv_path, "a");
         FILE* cpuLossesCsv = fopenCheck(cpu_losses_csv_path, "a");
 
         int* inferencePrompt = (int*)mallocCheck(T * sizeof(int));

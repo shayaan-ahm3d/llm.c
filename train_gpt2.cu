@@ -1528,6 +1528,8 @@ int main(int argc, char *argv[]) {
     char fs_path[256] = "";  // used if init_method set to "fs" -> set to a shared filesystem path
     const char* hellaswag_path_arg = NULL;
     const char* gpu_losses_csv_path = "gpu_eval_losses.csv";
+    const char* gpu_times_csv_path = "gpu_times.csv";
+    const char* gpu_token_times_csv_path = "gpu_token_times.csv";
     bool printHellaSwag = true;
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
@@ -1562,6 +1564,8 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
         else if (argv[i][1] == 'H') { hellaswag_path_arg = argv[i+1]; }
         else if (argv[i][1] == 'K') { gpu_losses_csv_path = argv[i+1]; }
+        else if (argv[i][1] == 'T') { gpu_times_csv_path = argv[i+1]; }
+        else if (argv[i][1] == 'P') { gpu_token_times_csv_path = argv[i+1]; }
         else if (argv[i][1] == 'Z') { printHellaSwag = (bool)atoi(argv[i+1]); }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
@@ -1805,13 +1809,10 @@ int main(int argc, char *argv[]) {
             logger_log_val(&logger, step, val_loss);
         }
 
-        // HellaSwag inference benchmark (per-prompt autoregressive generation with timing)
         if (run_hellaswag) {
             NvtxRange evaluation_range("evaluation");
-            const char* GPU_TIMES = "gpu_times.csv";
-            const char* GPU_TOKEN_TIMES = "gpu_token_times.csv";
-            FILE* timeFile = fopenCheck(GPU_TIMES, "a");
-            FILE* tokenTimeFile = fopenCheck(GPU_TOKEN_TIMES, "a");
+            FILE* timeFile = fopenCheck(gpu_times_csv_path, "a");
+            FILE* tokenTimeFile = fopenCheck(gpu_token_times_csv_path, "a");
             FILE* gpuLossesCsv = fopenCheck(gpu_losses_csv_path, "a");
             unsigned long long sample_rng_state = 1337;
             evalloader_reset(&eval_loader);
@@ -1819,7 +1820,9 @@ int main(int argc, char *argv[]) {
             for (int i = 0; i < val_max_steps; i++) {
                 evalloader_next_batch(&eval_loader);
                 const int contextLength = eval_loader.contextLength;
-                for (int k = 0; k < T; k++) { inferencePrompt[k] = tokenizer.eot_token; }
+                for (int k = 0; k < T; k++) {
+                    inferencePrompt[k] = tokenizer.eot_token;
+                }
                 for (int k = 0; k < contextLength; k++) {
                     inferencePrompt[k] = eval_loader.inputs[k];
                 }
