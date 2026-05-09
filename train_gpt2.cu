@@ -1940,9 +1940,9 @@ void inference(GPT2* model,
             double tokMs = 1e3 * ((tokEnd.tv_sec - tokStart.tv_sec) + (tokEnd.tv_nsec - tokStart.tv_nsec) / 1e9);
             fprintf(tokenTimesFile, "%d,%zu,%lf\n", callIndex, tokenIndex - contextLength + 1, tokMs);
         }
-        if (next_token == tokenizer->eot_token) {
+       /* if (next_token == tokenizer->eot_token) {
             break;
-        }
+        }*/
         if (print) {
             if (tokenizer->init_ok) {
                 safe_printf(tokenizer_decode(tokenizer, next_token));
