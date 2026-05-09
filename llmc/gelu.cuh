@@ -26,13 +26,6 @@ __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int N_vec) 
     store128(out + idx, packed_out);
 }
 
-__global__ void gelu_forward_tail_kernel(floatX* out, const floatX* inp, int start, int N) {
-    int idx = start + blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N) { return; }
-    float xi = (float)inp[idx];
-    float cube = 0.044715f * xi * xi * xi;
-    out[idx] = (floatX)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
-}
 
 __global__ void gelu_backward_inplace_kernel(floatX* d_in_out, const floatX* inp, int N_vec) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
@@ -54,18 +47,6 @@ __global__ void gelu_backward_inplace_kernel(floatX* d_in_out, const floatX* inp
     store128(d_in_out + idx, packed_dinp);
 }
 
-__global__ void gelu_backward_inplace_tail_kernel(floatX* d_in_out, const floatX* inp, int start, int N) {
-    int idx = start + blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N) { return; }
-    float x = (float)inp[idx];
-    float cube = 0.044715f * x * x * x;
-    float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
-    float tanh_out = tanhf(tanh_arg);
-    float coshf_out = coshf(tanh_arg);
-    float sech_out = 1.0f / (coshf_out * coshf_out);
-    float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
-    d_in_out[idx] = (floatX)(local_grad * (float)d_in_out[idx]);
-}
 
 // ----------------------------------------------------------------------------
 // kernel launchers
@@ -75,17 +56,8 @@ void gelu_forward(floatX* out, const floatX* inp, int N, cudaStream_t stream) {
     if (N <= 0) { return; }
 
     const int vec_block_size = 512;
-    const int tail_block_size = 256;
-    const int N_vec = (N / (int)x128::size) * (int)x128::size;
-
-    if (N_vec > 0) {
-        const int vec_grid_size = CEIL_DIV(N_vec, vec_block_size * (int)x128::size);
-        gelu_forward_kernel2<<<vec_grid_size, vec_block_size, 0, stream>>>(out, inp, N_vec);
-    }
-    if (N_vec < N) {
-        const int tail_grid_size = CEIL_DIV(N - N_vec, tail_block_size);
-        gelu_forward_tail_kernel<<<tail_grid_size, tail_block_size, 0, stream>>>(out, inp, N_vec, N);
-    }
+    const int vec_grid_size = CEIL_DIV(N, vec_block_size * (int)x128::size);
+    gelu_forward_kernel2<<<vec_grid_size, vec_block_size, 0, stream>>>(out, inp, N);
 
     cudaCheck(cudaGetLastError());
 }
@@ -95,17 +67,8 @@ void gelu_backward_inplace(floatX* d_in_out, const floatX* inp, const int N, cud
     if (N <= 0) { return; }
 
     const int vec_block_size = 128;
-    const int tail_block_size = 256;
-    const int N_vec = (N / (int)x128::size) * (int)x128::size;
-
-    if (N_vec > 0) {
-        const int vec_grid_size = CEIL_DIV(N_vec, vec_block_size * (int)x128::size);
-        gelu_backward_inplace_kernel<<<vec_grid_size, vec_block_size, 0, stream>>>(d_in_out, inp, N_vec);
-    }
-    if (N_vec < N) {
-        const int tail_grid_size = CEIL_DIV(N - N_vec, tail_block_size);
-        gelu_backward_inplace_tail_kernel<<<tail_grid_size, tail_block_size, 0, stream>>>(d_in_out, inp, N_vec, N);
-    }
+    const int vec_grid_size = CEIL_DIV(N, vec_block_size * (int)x128::size);
+    gelu_backward_inplace_kernel<<<vec_grid_size, vec_block_size, 0, stream>>>(d_in_out, inp, N);
 
     cudaCheck(cudaGetLastError());
 }

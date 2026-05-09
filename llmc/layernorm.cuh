@@ -187,9 +187,6 @@ __global__ void layernorm_forward_inference_kernel(float* __restrict__ output,
     // final normalization and scaling by weight/bias
     float* o = output + sequence*maxSequenceLength*dimensions + currentToken*dimensions;
     for (int c = lane_id; c < dimensions; c += WARP_SIZE) {
-        // load and store using the .cs "streaming" hint to the compiler,
-        // indicating that this data will not be reused soon, and can be streamed through the caches
-        // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
         float n = s*(__ldcs(x + c) - m);
         __stcs(o + c, (float)(n*(float)weight[c] + (float)bias[c]));
     }
