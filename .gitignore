@@ -36,3 +36,6 @@ dev/cuda/global_norm
 
 # log files
 *.log
+
+# profiler output
+profiles/
