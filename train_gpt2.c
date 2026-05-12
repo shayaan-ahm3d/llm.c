@@ -1984,9 +1984,9 @@ void inference(GPT2* model,
 			double tokMs = 1e3 * ((tokEnd.tv_sec - tokStart.tv_sec) + (tokEnd.tv_nsec - tokStart.tv_nsec) / 1e9);
 			fprintf(tokenTimesFile, "%d,%d,%lf\n", callIndex, currentToken - contextLength + 1, tokMs);
 		}
-		if (next_token == tokenizer->eot_token) {
+		/*if (next_token == tokenizer->eot_token) {
 			break; // stop generation if we hit <|endoftext|>
-		}
+		}*/
 		if (print) {
 			if (tokenizer->init_ok) {
 			    const char* token_str = tokenizer_decode(tokenizer, next_token);
