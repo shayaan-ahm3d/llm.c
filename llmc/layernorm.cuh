@@ -180,7 +180,6 @@ __global__ void layernorm_forward_inference_kernel(float* __restrict__ output,
         __stcs(rstd + idx, s);
     }
 
-    // final normalization and scaling by weight/bias
     float* o = output + sequence*maxSequenceLength*dimensions + currentToken*dimensions;
     for (int c = lane_id; c < dimensions; c += WARP_SIZE) {
         float n = s*(__ldcs(x + c) - m);
